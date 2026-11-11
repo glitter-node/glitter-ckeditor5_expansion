@@ -1,0 +1,217 @@
+{
+    "content": {
+        "media_embed": {
+            "unsupported": "This embed is not supported. Showing a link instead.",
+            "view_on": "View on {platform}",
+            "open_link": "Open link"
+        },
+        "video": {
+            "open": "Open video source",
+            "loop_on": "Turn loop on",
+            "loop_off": "Turn loop off"
+        },
+        "code_copy": {
+            "label": "Copy code",
+            "done": "Copied"
+        }
+    },
+    "editor": {
+        "data_source": {
+            "settings": "Glitter CKEditor5 Expansion Settings"
+        },
+        "video": {
+            "button": "Upload video",
+            "hint": "{exts} · up to {max}MB",
+            "uploading": "Uploading…",
+            "done": "Inserted. It will play in the post once saved.",
+            "login_required": "로그인이 필요합니다.",
+            "err_ext": "Only MP4 files can be uploaded.",
+            "err_size": "File is too large (max {max}MB).",
+            "err_editor": "Editor not found. Please try again in a moment.",
+            "err_generic": "Upload failed.",
+            "library": "Video library",
+            "insert": "Insert",
+            "size_sm": "S",
+            "size_md": "M",
+            "size_lg": "L",
+            "autoplay": "Autoplay",
+            "muted": "Muted",
+            "loop": "Loop"
+        },
+        "image": {
+            "too_large_client_check": "The image is too large (max {max}MB). Please try a smaller image.",
+            "upload_pending_submit_blocked": "Please wait until the image upload finishes, then press the button again.",
+            "uploading_button_label": "Uploading",
+            "upload_timeout": "The image upload took too long and was cancelled. Check the file size or your network and try again."
+        }
+    },
+    "settings": {
+        "title": "Glitter CKEditor5 Expansion Settings",
+        "description": "Turn each feature on or off and adjust its detailed options.",
+        "notice": "Turn each feature on or off and adjust its detailed options.",
+        "tabs": {
+            "sns": "SNS link embeds",
+            "linkcard": "External link cards",
+            "video": "Local video upload",
+            "md": "Markdown auto-convert",
+            "editorstyle": "Editor style",
+            "imagepaste": "Image paste",
+            "codeformat": "Code formatting"
+        },
+        "sns": {
+            "intro": "When a YouTube, X (Twitter), Instagram or TikTok link is pasted on its own line, it is shown as a playable embed on the visitor-facing page.",
+            "platforms_label": "Per-platform"
+        },
+        "linkcard": {
+            "intro": "Non-embed external links (news, blogs, etc.) are shown as a card with a thumbnail, title, summary and domain. The metadata is fetched server-side on the visitor's behalf."
+        },
+        "video": {
+            "intro": "An 'Upload video' button appears above the editor. Pick a file and it is uploaded in chunks; when done, a video player is inserted into the body right away (visible before you save). It also plays for visitors on the saved post. Files are stored in a folder separate from board attachments, and the container signature (MP4/MOV = ftyp, WebM = EBML) is checked so files with a faked extension are rejected.",
+            "formats_label": "Allowed extensions",
+            "mp4_always": ".mp4 (always allowed)",
+            "codec_note": "Whether a file plays depends on the browser's codec support. In particular, recent iPhone .mov files (HEVC / H.265) will not play in Firefox or older Chrome — this cannot be fixed without transcoding and is out of scope here. H.264-encoded .mp4 has the widest compatibility."
+        },
+        "fields": {
+            "sns_enabled": {
+                "label": "Enable SNS link embeds",
+                "hint": "When off, SNS links are left as plain links instead of being embedded."
+            },
+            "sns_youtube": {
+                "label": "YouTube (videos & Shorts)"
+            },
+            "sns_twitter": {
+                "label": "X (Twitter)"
+            },
+            "sns_instagram": {
+                "label": "Instagram (posts & Reels)"
+            },
+            "sns_tiktok": {
+                "label": "TikTok"
+            },
+            "sns_shorts_ratio": {
+                "label": "YouTube Shorts aspect ratio",
+                "hint": "Width:height ratio of the Shorts embed box. The real orientation cannot be known from the URL alone, so non-vertical Shorts get letterboxed."
+            },
+            "linkcard_enabled": {
+                "label": "Enable external link cards",
+                "hint": "When off, plain external links are left as-is instead of being turned into cards."
+            },
+            "linkcard_minimal_enabled": {
+                "label": "Show minimal cards",
+                "hint": "When no thumbnail or summary was obtained but a title was (e.g. a Cloudflare challenge page), show a favicon + title + domain minimal card. When off, such links are left as-is."
+            },
+            "linkcard_image_size": {
+                "label": "Card thumbnail size (px)",
+                "hint": "Square side length of the full card thumbnail. (80 - 400)"
+            },
+            "linkcard_ttl_ok_days": {
+                "label": "Success cache TTL (days)",
+                "hint": "How many days to reuse metadata for links that produced a card. After this it is re-fetched on the next view. (1 - 90)"
+            },
+            "linkcard_ttl_fail_hours": {
+                "label": "Failure cache TTL (hours)",
+                "hint": "How many hours before retrying links that failed or had no metadata. Shorter recovers from transient failures faster but hits the remote server more often. (1 - 720)"
+            },
+            "video_enabled": {
+                "label": "Enable local video upload",
+                "hint": "When off, the 'Upload video' button disappears from the editor and existing videos show as links instead of players."
+            },
+            "video_max_mb": {
+                "label": "Max file size (MB)",
+                "hint": "Maximum size of a single uploadable video. Unlimited is not allowed (disk protection); the hard cap is 2048 MB. (1 - 2048)"
+            },
+            "video_chunk_mb": {
+                "label": "Chunk size (MB)",
+                "hint": "Size of the pieces a large file is split into. Must be below the server upload limit (35 MB by default). Larger means fewer round-trips and a faster upload. (1 - 28, recommended 20)"
+            },
+            "video_allow_mov": {
+                "label": ".mov (QuickTime / iPhone)"
+            },
+            "video_allow_webm": {
+                "label": ".webm (web standard / VP8·VP9·AV1)"
+            },
+            "video_allow_m4v": {
+                "label": ".m4v"
+            },
+            "video_retention_days": {
+                "label": "Auto-delete retention (days, 0 = keep forever)",
+                "hint": "Default 0 — never auto-delete. Set 1+ to delete daily any video file not referenced by any post and older than this. Videos in use are never removed. (0 - 3650)"
+            },
+            "md_enabled": {
+                "label": "Enable markdown auto-convert",
+                "hint": "Convert markdown marks to real formatting when a visitor views the post. Turn it off for boards where users deliberately type `#`, `*` or `-`. Each element can be toggled below."
+            },
+            "md_heading": {
+                "label": "Headings — line-start `#` `##` `###` → Heading 1/2/3"
+            },
+            "md_bold": {
+                "label": "Bold — `**bold**` → bold"
+            },
+            "md_italic": {
+                "label": "Italic — `*italic*` → italic (off by default; easily confused with a stray `*` in prose)"
+            },
+            "md_list": {
+                "label": "Lists — `- item` or `1. item` on 2+ consecutive lines → bulleted / numbered list"
+            },
+            "md_link": {
+                "label": "Links — `[text](https://url)` → hyperlink"
+            },
+            "md_code": {
+                "label": "Code — `` `inline code` `` and fenced ``` code blocks"
+            },
+            "md_quote": {
+                "label": "Blockquote — line-start `> ` → quote block"
+            },
+            "md_table": {
+                "label": "Tables — `| head | head |` followed by `|---|---|` → table (first row = header; bold/links in cells converted)"
+            },
+            "md_hr": {
+                "label": "Horizontal rule — whole-line `---` → rule (when off, shown as literal text)"
+            },
+            "editor_style_enabled": {
+                "label": "Enable editor style",
+                "hint": "Changes the post body's base font size and line height to the values below. When off, the sirsoft-ckeditor5 default is shown."
+            },
+            "editor_font_size": {
+                "label": "Base font size (px)",
+                "hint": "Base font size for the post body (both the writing screen and the published post). Text with an explicit size set via the editor's own font-size tool is unaffected. (12 - 28)"
+            },
+            "editor_line_height": {
+                "label": "Line height (multiplier)",
+                "hint": "Spacing between lines in the body. 1.6 is a comfortable default for reading."
+            },
+            "editor_apply_to_comments": {
+                "label": "Also apply to comments",
+                "hint": "When on, the same font size and line height are also applied to comments. This may look different from the default sirsoft-basic comment style."
+            },
+            "imagepaste_enabled": {
+                "label": "Auto-upload pasted clipboard images",
+                "hint": "Right-click-copying or dragging an image from another site and pasting it into the post body editor uploads it to the server automatically and renders it. When off, this plugin's paste interception (auto-upload of external images, locking the 'submit' button while an upload is in progress, etc.) is fully disabled and sirsoft-ckeditor5's default behavior takes over — pasting a real screenshot (where the clipboard holds an actual image file) still works regardless of this setting, but the safeguard against submitting while an upload is still in progress is disabled along with it."
+            },
+            "imagepaste_webp_enabled": {
+                "label": "Auto-convert uploaded PNG images to WebP",
+                "hint": "To offset browsers re-encoding pasted images as PNG (which inflates file size), PNG uploads are re-compressed to WebP on the server (lossless first, falling back to high-quality lossy compression if needed, automatically keeping the original if the result would be larger). This works independently of the clipboard-paste setting above — it also applies to PNGs uploaded via the regular file picker."
+            },
+            "codeformat_enabled": {
+                "label": "Enable code formatting buttons",
+                "hint": "When on, the post editor toolbar gets inline code and code block buttons. When off, only the buttons go away; code in existing posts still displays as before."
+            }
+        },
+        "md": {
+            "intro": "Text pasted from an AI assistant (ChatGPT, etc.) often keeps literal markdown marks like `##` or `**bold**` instead of real formatting. When this is on, those marks are turned into real formatting (headings, bold, lists, …) as the visitor views the post. The stored text is left untouched — conversion happens only at render time and never touches the editor.",
+            "elements_label": "Elements to convert",
+            "falsepos_note": "To limit false positives, only strict markdown in the form 'line start + mark + space + content' is converted. Lists need 2+ consecutive matching lines; bold/italic only match `**...**` not wrapped in whitespace. Paragraphs you already formatted in the editor (links, bold, …) are skipped."
+        },
+        "editorstyle": {
+            "intro": "Applies a site-wide base font size and line height to the post body editor. This also applies to already-published posts. By default it does not affect comments; turn on 'Also apply to comments' below to extend it to comments too."
+        },
+        "imagepaste": {
+            "intro": "Controls what happens when an image is pasted into the post body editor. The two settings below are independent and can be toggled separately."
+        },
+        "codeformat": {
+            "intro": "Adds inline code and code block (plain text) buttons to the post editor. Text inside code is shown as typed, without being turned into formatting or wiki links. Saved code is always styled for display, whatever this setting is."
+        }
+    }
+}
+
+

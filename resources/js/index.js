@@ -1,0 +1,2461 @@
+/**
+ * glitter-ckeditor5_expansion — 프론트 스크립트 (global 전략, 전 페이지 로드)
+ *
+ * CKEditor 5(`sirsoft-ckeditor5`)로 쓴 본문은 순수 HTML(`<a href>`·`<pre>`·마크다운 글자)로 저장된다.
+ * 이 스크립트는 저장 데이터를 바꾸지 않고 화면에서만 다음을 한다.
+ *
+ *  방문자 화면(`.ck-content`, 편집 영역 제외)
+ *   - 마크다운 문법을 서식으로 변환(제목·목록·인용·표·구분선·코드·링크·굵게·기울임)
+ *   - 코드 블록에 복사 버튼
+ *   - 이 플러그인 동영상 링크를 `<video>` 플레이어로
+ *   - 단독 SNS 링크(YouTube·X·Instagram·TikTok)를 임베드로
+ *   - 그 밖의 단독 외부 링크를 서버 프리뷰 API 로 OG 카드 / 최소 카드로
+ *  글쓰기 화면(게시글 본문 에디터)
+ *   - 동영상 업로드 바·라이브러리, 클립보드 이미지 붙여넣기와 업로드 보호(제출 대기·시간 초과)
+ *   - 에디터 스타일(글자 크기·줄 간격 표식), 코드·코드 블록 버튼(`ClassicEditor.create` 감싸기)
+ *   - 저장된 코드 표시 스타일(툴바 코드·마크다운 코드 같은 모양)
+ *
+ * 설정은 `window.G7Config.plugins['glitter-ckeditor5_expansion']`(관리자 설정의 frontend_schema
+ * 노출분)에서 읽는다. 기능이 꺼져 있으면 해당 처리를 건너뛴다.
+ *
+ * 구조(1.6.0): 이 파일(00)이 IIFE 를 열고 `99-tail.js` 가 닫는다. `01~09` 코어(설정·번역·
+ * 유틸·영역·섹션 등록부·스케줄러), `10~79` 기능 섹션(각 조각 끝에서 `core.section()` 으로 등록),
+ * `90` 부팅. 감시기 하나가 방문자 스캔(200ms 트레일링)·편집기 스캔(250ms 고정 창)을 요청한다.
+ *
+ * 설계 원칙:
+ *  - **CKEditor 본체를 건드리지 않는다** — 저장 데이터는 그대로. 임베드·카드·서식은 화면에서만.
+ *  - **멱등** — 처리 표시를 남겨 다시 돌아도 중복 생성이 없다.
+ *  - **조용히 깨지지 않는다** — 임베드는 원문 링크 버튼을 남기고, 카드화 실패 시 원본 링크를 둔다.
+ *    한 기능이 예외를 내면 그 기능만 건너뛰고 경고를 한 번 남긴다(`warnOnce`).
+ *  - **SPA 대응** — DOMContentLoaded + rAF + 지연 재시도 + body MutationObserver.
+ *
+ * (레거시: `sirsoft-ckeditor5` 다운스트림 포크가 previewsInData:false 로 저장하던
+ *  `<figure class="media"><oembed url></oembed></figure>` 형태도 함께 처리한다 — 있으면.)
+ */
+(function () {
+  'use strict';
+
+  var IDENTIFIER = 'glitter-ckeditor5_expansion';
+
+  var logger = (window.G7Core && window.G7Core.createLogger && window.G7Core.createLogger('Plugin:' + IDENTIFIER)) || {
+    log: function () {},
+    warn: function () {},
+    error: function () {}
+  };
+
+
+
+  /* ================================================================ *
+   *  설정
+   * ================================================================ */
+
+  function asBool(value, fallback) {
+    if (value === undefined || value === null) return fallback;
+    if (typeof value === 'string') return value !== 'false' && value !== '0' && value !== '';
+    return Boolean(value);
+  }
+
+  function asInt(value, fallback, min, max) {
+    var n = parseInt(value, 10);
+    if (!isFinite(n)) n = fallback;
+    return Math.max(min, Math.min(max, n));
+  }
+
+  function readSettings() {
+    var s = (window.G7Config && window.G7Config.plugins && window.G7Config.plugins[IDENTIFIER]) || {};
+    var ratio = String(s.sns_shorts_ratio || '9/16');
+    if (!/^\d{1,2}\/\d{1,2}$/.test(ratio)) ratio = '9/16';
+    return {
+      snsEnabled: asBool(s.sns_enabled, true),
+      snsYoutube: asBool(s.sns_youtube, true),
+      snsTwitter: asBool(s.sns_twitter, true),
+      snsInstagram: asBool(s.sns_instagram, true),
+      snsTiktok: asBool(s.sns_tiktok, true),
+      shortsRatio: ratio,
+      linkcardEnabled: asBool(s.linkcard_enabled, true),
+      linkcardMinimal: asBool(s.linkcard_minimal_enabled, true),
+      imageSize: asInt(s.linkcard_image_size, 168, 80, 400),
+      videoEnabled: asBool(s.video_enabled, true),
+      videoMaxMb: asInt(s.video_max_mb, 200, 1, 2048),
+      videoChunkMb: asInt(s.video_chunk_mb, 20, 1, 28),
+      videoAllowMov: asBool(s.video_allow_mov, true),
+      videoAllowWebm: asBool(s.video_allow_webm, true),
+      videoAllowM4v: asBool(s.video_allow_m4v, false),
+      mdEnabled: asBool(s.md_enabled, true),
+      mdHeading: asBool(s.md_heading, true),
+      mdBold: asBool(s.md_bold, true),
+      mdItalic: asBool(s.md_italic, false),
+      mdList: asBool(s.md_list, true),
+      mdLink: asBool(s.md_link, true),
+      mdCode: asBool(s.md_code, true),
+      mdQuote: asBool(s.md_quote, true),
+      mdTable: asBool(s.md_table, true),
+      mdHr: asBool(s.md_hr, true),
+      editorStyleEnabled: asBool(s.editor_style_enabled, false),
+      editorFontSize: asInt(s.editor_font_size, 16, 12, 28),
+      editorLineHeight: asLineHeight(s.editor_line_height, '1.6'),
+      editorApplyToComments: asBool(s.editor_apply_to_comments, false),
+      imagePasteEnabled: asBool(s.imagepaste_enabled, true)
+    };
+  }
+
+  /** 줄간격은 Select 로 고정된 프리셋 값만 허용(임의 값 유입 방지, 레이아웃 파손 방어). */
+  function asLineHeight(value, fallback) {
+    var allowed = ['1.2', '1.4', '1.6', '1.8', '2.0'];
+    var v = String(value == null ? '' : value);
+    return allowed.indexOf(v) !== -1 ? v : fallback;
+  }
+
+  /** 설정 `codeformat_enabled`(기본 켜짐)를 에디터 생성 시점에 읽는다. */
+  function codeFormatEnabled() {
+    var s = (window.G7Config && window.G7Config.plugins && window.G7Config.plugins[IDENTIFIER]) || {};
+    return asBool(s.codeformat_enabled, true);
+  }
+
+
+
+  function t(key, fallback) {
+    var translate = window.G7Core && window.G7Core.t;
+    if (typeof translate !== 'function') return fallback;
+    var full = IDENTIFIER + '.' + key;
+    var r = translate(full);
+    return (typeof r === 'string' && r !== full) ? r : fallback;
+  }
+
+
+
+  /* ================================================================ *
+   *  공통 유틸
+   * ================================================================ */
+
+  var EMBED_WRAPPER_CLASS = 'ck5-media-embed';
+  // public_id 만 잡으면 되므로 상대/절대 URL 모두 매칭. 링크 텍스트는 상관 안 함.
+  var VIDEO_URL_RE = /\/api\/plugins\/glitter-ckeditor5_expansion\/video\/([a-f0-9]{32})\b/i;
+
+  var dynamicSheets = {};
+  function setDynamicRule(name, css) {
+    if (!('adoptedStyleSheets' in document) || typeof CSSStyleSheet === 'undefined') {
+      warnOnce('configurable styles require constructable stylesheets', new Error('Constructable stylesheets are unavailable'));
+      return;
+    }
+    var sheet = dynamicSheets[name];
+    if (!sheet) {
+      sheet = new CSSStyleSheet();
+      dynamicSheets[name] = sheet;
+      document.adoptedStyleSheets = document.adoptedStyleSheets.concat(sheet);
+    }
+    sheet.replaceSync(css);
+  }
+
+  function esc(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  function authToken() {
+    try {
+      if (window.G7Core && window.G7Core.apiClient && window.G7Core.apiClient.getToken) {
+        return window.G7Core.apiClient.getToken() || '';
+      }
+    } catch (e) {}
+    try { return localStorage.getItem('auth_token') || ''; } catch (e) { return ''; }
+  }
+
+  function isBareUrlLink(a) {
+    var href = a.getAttribute('href') || '';
+    if (!/^https?:\/\//i.test(href)) return false;
+    var text = (a.textContent || '').trim();
+    if (!/^https?:\/\//i.test(text)) return false;
+    var norm = function (u) { return u.replace(/\/+$/, '').toLowerCase(); };
+    return norm(text) === norm(href);
+  }
+
+  /** block(주로 <p>)의 유일한 의미 있는 자식이 맨URL 링크면 그 링크를 반환 */
+  function soleLinkOf(block) {
+    if ((block.textContent || '').trim() === '') return null;
+    var els = [];
+    for (var i = 0; i < block.children.length; i++) els.push(block.children[i]);
+    if (els.length !== 1) return null;
+    var only = els[0];
+    if (only.tagName !== 'A') return null;
+    if ((block.textContent || '').trim() !== (only.textContent || '').trim()) return null;
+    return isBareUrlLink(only) ? only : null;
+  }
+
+  var warnedTags = {}; // warnOnce 가 이미 알린 대상
+
+  /** 안전장치 공통: 예외로 건너뛴 대상(tag)을 console.warn 으로 한 번만 알린다(09a 방식, console.error 는 쓰지 않는다). */
+  function warnOnce(tag, reason) {
+    if (warnedTags[tag]) return;
+    warnedTags[tag] = true;
+    try { console.warn('[' + IDENTIFIER + '] ' + tag + ' skipped: ' + (reason && reason.message ? reason.message : reason)); } catch (e) {}
+  }
+
+
+
+  /** el 이 CKEditor 편집 영역(본문·댓글 편집기) 안이면 true. 편집 영역도 `.ck-content` 라 방문자 스캔에서 뺄 때 쓴다. */
+  function isEditingArea(el) {
+    return !!(el && el.closest && el.closest('.ck-editor__editable, .ck-editor'));
+  }
+
+  /** 살아있는 CKEditor 인스턴스를 컨테이너 근처에서 찾는다. */
+  function editorInstanceNear(container) {
+    var scopes = [container, container.parentElement, container.nextElementSibling];
+    for (var i = 0; i < scopes.length; i++) {
+      var sc = scopes[i];
+      if (!sc || !sc.querySelectorAll) continue;
+      var eds = sc.querySelectorAll('.ck-editor__editable_inline, .ck-editor__editable');
+      for (var j = 0; j < eds.length; j++) {
+        if (eds[j].ckeditorInstance) return eds[j].ckeditorInstance;
+      }
+    }
+    return null;
+  }
+
+
+
+  function scanEditors() {
+    // 동영상 업로드 바/이미지 복붙 둘 다 켜짐 여부를 각자 내부에서
+    // 확인하므로(attachUploaderTo, attachPasteImageHandlerTo) 여기선 컨테이너 존재만
+    // 확인한다. (이전엔 `if (!cfg.videoEnabled) return;` 로 videoEnabled 가
+    // 꺼지면 이 순회 자체를 건너뛰었는데, 그러면 videoEnabled 와 무관한 다른
+    // 기능까지 함께 막히므로 제거했다 — 각 attach 함수가 자기 설정을 스스로
+    // 확인하는 현재 구조가 버그 없이 이미 검증됨, 원복하지 않고 유지)
+    var containers = document.querySelectorAll('.ckeditor5-wrapper, [id^="ckeditor5-"]');
+    for (var i = 0; i < containers.length; i++) {
+      // 에디터가 실제로 붙었는지 확인 (editable 존재)
+      var cont = containers[i];
+      // 본문 안에서 편집 영역을 실제로 품은 요소만(head 의 ckeditor5-* link·style·script 제외)
+      if (!document.body.contains(cont) || !cont.querySelector('.ck-editor__editable')) continue;
+      if (!editorInstanceNear(cont)) continue;
+      runEditors(cont);
+    }
+    // 편집 스타일 표식은 위 컨테이너 목록과 무관하게 고정 구조로 찾는다.
+    runEditorEnds();
+  }
+
+
+
+  /* ================================================================ *
+   *  섹션 등록부 · 방문자 패스
+   * ================================================================ *
+   *  기능 섹션은 번들 평가 때 자기 조각 끝에서 `core.section(spec)` 으로 등록한다.
+   *  등록부는 이 IIFE 안에만 있고 window 에 올리지 않는다.
+   *  - 방문자 패스는 `order` 오름차순(같은 값은 등록 순)으로 섹션을 부른다. 결합 순서에 기대지 않는다.
+   *  - `gate(cfg)` 가 있는 섹션 중 하나라도 참이어야 `.ck-content` 를 돈다. 모두 거짓이면
+   *    게이트 없는 섹션만 root 에 한 번 부른다(1.5.0 scan 의 조기 반환과 같다).
+   *  - 편집기 패스는 `editorOrder` 오름차순으로 컨테이너마다 `editor(container)` 를, 스캔 끝에
+   *    `editorEnd()` 를 부른다. `boot(cfg)` 는 부팅 run() 첫머리에서 한 번.
+   *  - `install()` 은 등록 직후 그 자리에서 바로 부른다(= 번들 평가 중 그 조각의 위치).
+   *  - 받기만 하고 아직 부르지 않는 항목: settings·guard.
+   *  - `load` 는 'eager' 만 받는다(지연 로드는 자리만 둔다).
+   */
+
+  var sections = []; // 등록된 섹션 spec — 방문자 order 오름차순, order 없는 섹션은 뒤
+  var editorSections = []; // 편집기 섹션 spec — editorOrder 오름차순, editorOrder 없는 섹션은 뒤
+  var namespaces = {};
+
+  var core = {
+    id: IDENTIFIER,
+    section: registerSection,
+    ns: function (name) { return namespaces[name] || (namespaces[name] = {}); }
+  };
+
+  function isVisitorSection(spec) {
+    return spec.scope === 'visitor' || spec.scope === 'both';
+  }
+
+  function visitorOrderOf(spec) {
+    return isVisitorSection(spec) ? spec.order : Infinity;
+  }
+
+  function isEditorSection(spec) {
+    return spec.scope === 'editor' || spec.scope === 'both';
+  }
+
+  function editorOrderOf(spec) {
+    return spec.editor ? spec.editorOrder : Infinity;
+  }
+
+  function registerSection(spec) {
+    if (!spec || typeof spec.name !== 'string' || !spec.name) { logger.warn('section: name is required'); return; }
+    for (var i = 0; i < sections.length; i++) {
+      if (sections[i].name === spec.name) { logger.warn('section: duplicate name ' + spec.name); return; }
+    }
+    if (spec.load !== undefined && spec.load !== 'eager') { logger.warn('section: only eager load is supported: ' + spec.name); return; }
+    if (isVisitorSection(spec) && typeof spec.order !== 'number') { logger.warn('section: visitor order is required: ' + spec.name); return; }
+    if (isEditorSection(spec) && spec.editor && typeof spec.editorOrder !== 'number') { logger.warn('section: editor order is required: ' + spec.name); return; }
+    var at = sections.length;
+    while (at > 0 && visitorOrderOf(sections[at - 1]) > visitorOrderOf(spec)) at--;
+    sections.splice(at, 0, spec);
+    if (isEditorSection(spec)) {
+      var ea = editorSections.length;
+      while (ea > 0 && editorOrderOf(editorSections[ea - 1]) > editorOrderOf(spec)) ea--;
+      editorSections.splice(ea, 0, spec);
+    }
+    if (spec.install) spec.install();
+  }
+
+  /** 방문자 스캔 한 번 동안 섹션끼리 나누는 표시. once 는 1.5.0 의 `if (!didX) { …; didX = true; }` 와 같다. */
+  function newVisitorContext() {
+    var flags = {};
+    return {
+      once: function (key, fn) {
+        if (flags[key]) return;
+        fn();
+        flags[key] = true;
+      },
+      has: function (key) { return !!flags[key]; }
+    };
+  }
+
+  /** 게이트가 있는 방문자 섹션 중 하나라도 켜져 있으면 true */
+  function visitorGateOpen(cfg) {
+    for (var i = 0; i < sections.length; i++) {
+      var s = sections[i];
+      if (isVisitorSection(s) && typeof s.gate === 'function' && s.gate(cfg)) return true;
+    }
+    return false;
+  }
+
+  /** 게이트가 닫혔을 때: 게이트 없는 방문자 섹션만 root 에 한 번씩 */
+  function runGateClosedVisitors(root, cfg) {
+    for (var i = 0; i < sections.length; i++) {
+      var s = sections[i];
+      if (isVisitorSection(s) && typeof s.gate !== 'function' && s.visitor) s.visitor(root, cfg, null);
+    }
+  }
+
+  /** `.ck-content` 하나(편집 영역 제외)에 켜진 방문자 섹션을 order 순으로 */
+  function runVisitors(scope, cfg, ctx) {
+    for (var i = 0; i < sections.length; i++) {
+      var s = sections[i];
+      if (!isVisitorSection(s) || !s.visitor) continue;
+      if (s.enabled && !s.enabled(cfg)) continue;
+      try { s.visitor(scope, cfg, ctx); } catch (e) { warnOnce('section ' + s.name + ' (visitor)', e); }
+    }
+  }
+
+  /** 방문자 스캔 한 번이 끝난 뒤 */
+  function runVisitorEnds(ctx, cfg) {
+    for (var i = 0; i < sections.length; i++) {
+      var s = sections[i];
+      if (isVisitorSection(s) && s.visitorEnd) s.visitorEnd(ctx, cfg);
+    }
+  }
+
+  /** 부팅(run() 첫머리) 때 한 번 */
+  function runBoots(cfg) {
+    for (var i = 0; i < sections.length; i++) {
+      if (sections[i].boot) sections[i].boot(cfg);
+    }
+  }
+
+  /** 편집기 컨테이너 하나(편집기 인스턴스 확인 뒤)에 편집기 섹션을 editorOrder 순으로 */
+  function runEditors(container) {
+    for (var i = 0; i < editorSections.length; i++) {
+      if (editorSections[i].editor) { try { editorSections[i].editor(container); } catch (e) { warnOnce('section ' + editorSections[i].name + ' (editor)', e); } }
+    }
+  }
+
+  /** 편집기 스캔 한 번이 끝난 뒤(컨테이너 목록과 무관) */
+  function runEditorEnds() {
+    for (var i = 0; i < editorSections.length; i++) {
+      if (editorSections[i].editorEnd) editorSections[i].editorEnd();
+    }
+  }
+
+
+
+  /* ================================================================ *
+   *  통합 스캔
+   * ================================================================ */
+
+  // 방문자 처리는 등록된 섹션을 order 순으로 부른다(06-registry). 섹션 순서: 마크다운 10 → 코드 복사 20
+  // → 동영상 30 → SNS 40 → 링크 카드 50.
+  function scan(root) {
+    root = root || document;
+    var cfg = readSettings();
+    if (!visitorGateOpen(cfg)) { runGateClosedVisitors(root, cfg); return; }
+
+    var contents;
+    try { contents = root.querySelectorAll('.ck-content'); } catch (e) { return; }
+    if (!contents.length && root !== document) return;
+    if (!contents.length) contents = document.querySelectorAll('.ck-content');
+    if (!contents.length) return;
+
+    var ctx = newVisitorContext();
+
+    for (var c = 0; c < contents.length; c++) {
+      var scope = contents[c];
+      if (isEditingArea(scope)) continue; // 편집 영역은 방문자 변환 대상이 아니다
+      runVisitors(scope, cfg, ctx);
+    }
+
+    runVisitorEnds(ctx, cfg);
+  }
+
+  /* ================================================================ *
+   *  관찰자 · 부팅
+   * ================================================================ */
+
+  // 스케줄러: 감시기 하나가 방문자·편집기 스캔 요청을 낸다. 두 요청의 타이머는 따로 둔다
+  // (방문자 200ms 트레일링, 편집기 250ms 고정 창). 해제는 하지 않는다(페이지 수명).
+  var observer = null;
+  var rescanTimer = null;
+  var editorScanTimer = null;
+
+  /** 추가된 요소 중 .ck-content 이거나 그 안이거나 그것을 품은 것이 있으면 true(방문자 스캔 조건) */
+  function hasContentAddition(records) {
+    return records.some(function (r) {
+      return Array.prototype.some.call(r.addedNodes, function (n) {
+        return n.nodeType === 1
+          && ((n.matches && (n.matches('.ck-content') || n.matches('.ck-content *')))
+            || (n.querySelector && n.querySelector('.ck-content')));
+      });
+    });
+  }
+
+  /** 방문자 스캔 요청 */
+  function requestVisitorScan() {
+    // 트레일링 디바운스 — 대기 중이어도 타이머를 새로 잡는다. (기존엔 rescanTimer!==null 이면
+    // 이벤트를 버려서, 콘텐츠가 두 번에 나눠 들어오면 뒤엣것을 놓쳤다.) scan() 은 멱등이라
+    // 자기 변경으로 옵저버가 한 번 더 울려도 no-op 스캔 1회 후 멎는다.
+    if (rescanTimer !== null) window.clearTimeout(rescanTimer);
+    rescanTimer = window.setTimeout(function () {
+      rescanTimer = null;
+      scan(document);
+    }, 200);
+  }
+
+  /** 편집기 스캔 요청: 첫 요청 기준 고정 창(대기 중이면 버린다) */
+  function requestEditorScan() {
+    if (editorScanTimer !== null) return;
+    editorScanTimer = window.setTimeout(function () { editorScanTimer = null; scanEditors(); }, 250);
+  }
+
+  /** 방문자 스캔 뒤 편집기 스캔, 같은 자리에서 동기로 */
+  function kick() {
+    scan(document);
+    scanEditors();
+  }
+
+  function ensureObserver() {
+    if (observer || typeof MutationObserver === 'undefined') return;
+    observer = new MutationObserver(function (records) {
+      // 같은 변경 묶음에서 방문자 요청(조건부)이 먼저, 편집기 요청(무조건)이 그다음.
+      // 방문자 판정이 실패해도 편집기 요청은 막지 않는다.
+      var hit = false;
+      try { hit = hasContentAddition(records); } catch (e) { warnOnce('scan observer', e); }
+      if (hit) requestVisitorScan();
+      requestEditorScan();
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+  }
+
+  function run() {
+    runBoots(readSettings());
+    ensureObserver();
+    if (window.requestAnimationFrame) {
+      requestAnimationFrame(function () { requestAnimationFrame(kick); });
+    } else {
+      kick();
+    }
+    window.setTimeout(kick, 400);
+    window.setTimeout(kick, 900);
+  }
+
+
+
+  /* ================================================================ *
+   *  마크다운 문법 → 서식 (렌더 시점 변환)
+   * ================================================================ */
+
+  function mdEsc(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  /** 한 텍스트 조각에 인라인 마크다운 적용 → HTML 문자열 (입력은 먼저 escape). */
+  function mdInline(str, cfg) {
+    var out = mdEsc(str);
+    var stash = [];
+    var keep = function (html) { stash.push(html); return '\u0001' + (stash.length - 1) + '\u0001'; };
+    if (cfg.mdCode) {
+      out = out.replace(/`([^`\n]+?)`/g, function (_, c) { return keep('<code data-ck5-mdc="1">' + c + '</code>'); });
+    }
+    if (cfg.mdLink) {
+      out = out.replace(/\[([^\]\n]{1,200}?)\]\((https?:\/\/[^\s)]{1,500}?)\)/g, function (_, label, u) {
+        return keep('<a data-ck5-mda="1" href="' + u.replace(/"/g, '%22') + '" target="_blank" rel="noopener noreferrer">' + label + '</a>');
+      });
+    }
+    if (cfg.mdBold) {
+      out = out.replace(/\*\*([^\s*][^*\n]*?[^\s*]|[^\s*])\*\*/g, '<strong>$1</strong>');
+    }
+    if (cfg.mdItalic) {
+      out = out.replace(/(^|[^*\w])\*([^\s*][^*\n]*?[^\s*]|[^\s*])\*(?!\*)/g, '$1<em>$2</em>');
+    }
+    out = out.replace(/\u0001(\d+)\u0001/g, function (_, i) { return stash[+i]; });
+    return out;
+  }
+
+  /** el 의 텍스트 노드들에 인라인 마크다운 적용 (사용자가 이미 서식 준 요소는 스킵). */
+  function mdApplyInline(el, cfg) {
+    if (!el || el.dataset.ck5MdInline === '1') return;
+    if (el.querySelector('a, strong, b, em, i, code, s, u, mark, sub, sup')) { el.dataset.ck5MdInline = '1'; return; }
+    var walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null);
+    var textNodes = [], n;
+    while ((n = walker.nextNode())) {
+      if (n.parentElement && n.parentElement.closest('code, pre, a')) continue;
+      textNodes.push(n);
+    }
+    textNodes.forEach(function (tn) {
+      var raw = tn.nodeValue;
+      if (!/[*`[]/.test(raw)) return;
+      var html = mdInline(raw, cfg);
+      if (html === mdEsc(raw)) return;
+      try {
+        var frag = document.createRange().createContextualFragment(html);
+        tn.parentNode.replaceChild(frag, tn);
+      } catch (e) {}
+    });
+    el.dataset.ck5MdInline = '1';
+  }
+
+  /** 구분선 줄: 같은 기호 3개 이상만(`---`, `***`, `___`), 공백·다른 문자 섞이면 아님. */
+  var MD_HR_RE = /^(?:-{3,}|\*{3,}|_{3,})$/;
+  /** GFM 표 구분 행: `|---|:---:|` 형태, 파이프 필수(파이프 없는 `---` 는 구분선). 정렬 표기는 무시. */
+  var MD_TABLE_DELIM_RE = /^\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)*\|?$/;
+
+  /** 표 한 행 → 셀 문자열 배열 (양끝 파이프 제거, `\|` 는 셀 안의 문자 `|`). */
+  function mdTableCells(line) {
+    var s = line.trim();
+    if (s.charAt(0) === '|') s = s.slice(1);
+    if (s.slice(-1) === '|' && s.slice(-2) !== '\\|') s = s.slice(0, -1);
+    var cells = [], buf = '';
+    for (var i = 0; i < s.length; i++) {
+      var ch = s.charAt(i);
+      if (ch === '\\' && s.charAt(i + 1) === '|') { buf += '|'; i++; }
+      else if (ch === '|') { cells.push(buf.trim()); buf = ''; }
+      else buf += ch;
+    }
+    cells.push(buf.trim());
+    return cells;
+  }
+
+  /** header 줄 + 다음 줄이 GFM 표 시작(헤더·구분 행 열 수 일치)이면 열 수, 아니면 0. */
+  function mdTableCols(header, delim) {
+    if (!header || !delim || header.indexOf('|') < 0 || delim.indexOf('|') < 0) return 0;
+    if (!MD_TABLE_DELIM_RE.test(delim)) return 0;
+    var n = mdTableCells(header).length;
+    return n === mdTableCells(delim).length ? n : 0;
+  }
+
+
+
+
+  /**
+   * `.ck-content` 안의 마크다운 문법을 실제 서식으로 바꾼다 (방문자 화면 전용 — 편집기
+   * editable 에서는 실행 안 함). 다른 승격 패스보다 먼저 돌아 링크가 `<a>` 가 된 뒤
+   * SNS/OG 카드 로직이 걸리게 한다.
+   *
+   * 오탐 방지: 블록 변환은 **줄 전체가 문법에 정확히 맞고**(공백 필수), 그 `<p>` 에 자식
+   * 엘리먼트가 없을 때만. 목록·순서목록은 **2줄 이상 연속**일 때만(단일 "- 문장" 무시).
+   * 기울임(`*x*`)은 기본 꺼짐. 사용자가 에디터 버튼으로 서식을 준 문단은 인라인 변환 스킵.
+   */
+  function renderMarkdown(scope, cfg) {
+    if (isEditingArea(scope)) return; // 편집 중에는 변환 안 함
+
+    // 블록 패스 + 인라인 패스 모두 멱등(변환 요소에 data-ck5-md* 마커). 스캔마다 다시 돌아도
+    // 이미 변환된 건 건너뛰므로, 콘텐츠가 뒤늦게/다시 렌더돼도 스스로 따라잡는다.
+    {
+
+      // Pasted markdown is often stored by CKEditor as <p>line1<br>line2<br>line3</p>
+      // (soft breaks). The block logic below assumes one line per <p>, so split any
+      // text-plus-<br>-only <p> that contains at least one block-markdown line into
+      // one <p> per <br> segment. Non-markdown multi-line paragraphs are left alone.
+      var BLOCK_MD_RE = /^(?:#{1,3}[ \t]|[-*+][ \t]|\d{1,3}\.[ \t]|>[ \t]?|```)/;
+      var splitTargets = [];
+      for (var si = 0; si < scope.children.length; si++) {
+        var sc = scope.children[si];
+        if (sc.dataset && sc.dataset.ck5Md) continue;
+        if (!/^(P|DIV)$/.test(sc.tagName)) continue;
+        if (sc.closest('.ck5-video, .' + EMBED_WRAPPER_CLASS + ', .ck5-linkcard, pre')) continue;
+        if (!sc.querySelector('br')) continue;
+        var onlyTextAndBr = true;
+        for (var cn = sc.firstChild; cn; cn = cn.nextSibling) {
+          if (cn.nodeType === 1 && cn.tagName !== 'BR') { onlyTextAndBr = false; break; }
+        }
+        if (onlyTextAndBr) splitTargets.push(sc);
+      }
+      splitTargets.forEach(function (pEl) {
+        var segs = [], buf = '';
+        for (var n = pEl.firstChild; n; n = n.nextSibling) {
+          if (n.nodeType === 1 && n.tagName === 'BR') { segs.push(buf); buf = ''; }
+          else if (n.nodeType === 3) buf += n.nodeValue;
+        }
+        segs.push(buf);
+        var anyMd = segs.some(function (s) { return BLOCK_MD_RE.test((s || '').replace(/ /g, ' ').trim()); });
+        if (!anyMd && (cfg.mdTable || cfg.mdHr)) {
+          var tl = segs.map(function (s) { return (s || '').replace(/ /g, ' ').trim(); });
+          anyMd = tl.some(function (s, ti) {
+            return (cfg.mdHr && MD_HR_RE.test(s)) || (cfg.mdTable && mdTableCols(s, tl[ti + 1]) > 0);
+          });
+        }
+        if (!anyMd) return;
+        var frag = document.createDocumentFragment();
+        segs.forEach(function (s) {
+          var np = document.createElement('p');
+          if ((s || '').replace(/ /g, ' ').trim() === '') np.appendChild(document.createElement('br'));
+          else np.textContent = s;
+          frag.appendChild(np);
+        });
+        pEl.replaceWith(frag);
+      });
+
+      var kids = [];
+      for (var i = 0; i < scope.children.length; i++) {
+        var k = scope.children[i];
+        // 이미 변환된 블록(제목·목록·인용·코드·표·구분선)은 재스캔 때도 kids 에 "경계"로 남긴다.
+        // 빠지면 그 앞뒤 줄이 연속으로 보여, 페이지의 반복 스캔에서 `- a` / `# 제목` / `- b` 가
+        // 한 목록으로 합쳐지고 제목 뒤로 밀린다. 경계는 pure() 가 false 라 어떤 변환 대상도 아니다.
+        if (k.dataset && k.dataset.ck5Md) { kids.push(k); continue; }
+        if (/^(P|DIV)$/.test(k.tagName) && !k.closest('.ck5-video, .' + EMBED_WRAPPER_CLASS + ', .ck5-linkcard, pre')) kids.push(k);
+      }
+      var lineOf = function (el) {
+        if (el.querySelector('br')) return null; // residual <br> <p> (not a split target) -> hold off block convert
+        return (el.textContent || '').replace(/ /g, ' ').trim();
+      };
+      var pure = function (el) { return !(el.dataset && el.dataset.ck5Md) && !el.querySelector('*'); };
+      var mergeList = function (kids, start, re, strip, tag) {
+        var run = [start], j = start + 1;
+        while (j < kids.length) {
+          var l = lineOf(kids[j]);
+          if (l && re.test(l) && pure(kids[j])) { run.push(j); j++; } else break;
+        }
+        if (run.length < 2) return -1;
+        var list = document.createElement(tag);
+        list.dataset.ck5Md = '1';
+        run.forEach(function (ri) {
+          var li = document.createElement('li');
+          li.textContent = lineOf(kids[ri]).replace(strip, '');
+          list.appendChild(li);
+        });
+        kids[run[0]].replaceWith(list);
+        for (var d = run.length - 1; d >= 1; d--) kids[run[d]].remove();
+        return run[run.length - 1];
+      };
+
+      var p = 0;
+      while (p < kids.length) {
+        var el = kids[p];
+        var line = lineOf(el);
+        if (line === null || line === '' || !pure(el)) { p++; continue; }
+
+        var hm = cfg.mdHeading && line.match(/^(#{1,3})[ \t]+(\S.*)$/);
+        if (hm) {
+          var h = document.createElement('h' + hm[1].length);
+          h.textContent = hm[2];
+          h.dataset.ck5Md = '1';
+          el.replaceWith(h); kids[p] = h; p++; continue;
+        }
+        if (cfg.mdList && /^[-*+][ \t]+\S/.test(line)) {
+          var e1 = mergeList(kids, p, /^[-*+][ \t]+\S/, /^[-*+][ \t]+/, 'ul');
+          if (e1 >= 0) { p = e1 + 1; continue; }
+        }
+        if (cfg.mdList && /^\d{1,3}\.[ \t]+\S/.test(line)) {
+          var e2 = mergeList(kids, p, /^\d{1,3}\.[ \t]+\S/, /^\d{1,3}\.[ \t]+/, 'ol');
+          if (e2 >= 0) { p = e2 + 1; continue; }
+        }
+        if (cfg.mdQuote && /^>[ \t]?/.test(line)) {
+          var qrun = [p], qj = p + 1;
+          while (qj < kids.length) {
+            var q2 = lineOf(kids[qj]);
+            if (q2 !== null && /^>[ \t]?/.test(q2) && pure(kids[qj])) { qrun.push(qj); qj++; } else break;
+          }
+          var bq = document.createElement('blockquote');
+          bq.dataset.ck5Md = '1';
+          qrun.forEach(function (ri, idx) {
+            if (idx) bq.appendChild(document.createElement('br'));
+            bq.appendChild(document.createTextNode(lineOf(kids[ri]).replace(/^>[ \t]?/, '')));
+          });
+          kids[qrun[0]].replaceWith(bq);
+          for (var d3 = qrun.length - 1; d3 >= 1; d3--) kids[qrun[d3]].remove();
+          p = qrun[qrun.length - 1] + 1; continue;
+        }
+        if (cfg.mdCode && /^```/.test(line)) {
+          var end = -1;
+          for (var f = p + 1; f < kids.length; f++) {
+            var fl = lineOf(kids[f]);
+            if (fl !== null && /^```\s*$/.test(fl) && !kids[f].dataset.ck5Md) { end = f; break; }
+          }
+          if (end > p) {
+            var pre = document.createElement('pre');
+            pre.className = 'ck5-md-pre'; pre.dataset.ck5Md = '1';
+            var code = document.createElement('code');
+            var lines = [];
+            for (var g = p + 1; g < end; g++) lines.push(kids[g].textContent || '');
+            code.textContent = lines.join('\n');
+            pre.appendChild(code);
+            kids[p].replaceWith(pre);
+            for (var d4 = end; d4 >= p + 1; d4--) kids[d4].remove();
+            p = end + 1; continue;
+          }
+        }
+        // 표·구분선은 기존 요소 판정이 모두 빗나간 줄에만 적용(기존 변환 결과 불변).
+        if (cfg.mdTable && p + 1 < kids.length && pure(kids[p + 1])) {
+          var cols = mdTableCols(line, lineOf(kids[p + 1]));
+          if (cols > 0) {
+            var rowEnd = p + 2;
+            while (rowEnd < kids.length) {
+              var rl = lineOf(kids[rowEnd]);
+              if (rl && rl.indexOf('|') >= 0 && pure(kids[rowEnd])) rowEnd++; else break;
+            }
+            var fig = document.createElement('figure');
+            fig.className = 'table';
+            fig.dataset.ck5Md = '1';
+            var tbl = document.createElement('table');
+            var addRow = function (parent, text, cellTag) {
+              var tr = document.createElement('tr');
+              var cells = mdTableCells(text);
+              for (var ci = 0; ci < cols; ci++) {
+                var cell = document.createElement(cellTag);
+                cell.innerHTML = mdInline(ci < cells.length ? cells[ci] : '', cfg);
+                cell.dataset.ck5MdInline = '1';
+                tr.appendChild(cell);
+              }
+              parent.appendChild(tr);
+            };
+            var thead = document.createElement('thead');
+            addRow(thead, line, 'th');
+            tbl.appendChild(thead);
+            if (rowEnd > p + 2) {
+              var tbody = document.createElement('tbody');
+              for (var r = p + 2; r < rowEnd; r++) addRow(tbody, lineOf(kids[r]), 'td');
+              tbl.appendChild(tbody);
+            }
+            fig.appendChild(tbl);
+            kids[p].replaceWith(fig);
+            for (var d5 = rowEnd - 1; d5 >= p + 1; d5--) kids[d5].remove();
+            kids.splice(p, rowEnd - p, fig);
+            p++; continue;
+          }
+        }
+        if (cfg.mdHr && MD_HR_RE.test(line)) {
+          // 방문자 화면 전용 렌더라 에디터의 HorizontalLine 로드 여부와 무관하게 <hr>.
+          // 토글이 꺼져 있으면 건드리지 않아 원문 글자(`---`) 그대로 보인다.
+          var hrEl = document.createElement('hr');
+          hrEl.dataset.ck5Md = '1';
+          el.replaceWith(hrEl); kids[p] = hrEl; p++; continue;
+        }
+        p++;
+      }
+    }
+
+    // 인라인 패스
+    var inlineEls = scope.querySelectorAll('p, h1, h2, h3, li, blockquote');
+    for (var m = 0; m < inlineEls.length; m++) {
+      var ie = inlineEls[m];
+      if (ie.closest('.ck5-video, .' + EMBED_WRAPPER_CLASS + ', .ck5-linkcard, pre')) continue;
+      mdApplyInline(ie, cfg);
+    }
+  }
+
+  // 다른 승격 패스보다 먼저 돌아 링크가 <a> 가 된 뒤 SNS/카드 패스가 걸리게 한다(order 10 = 맨 앞).
+  core.section({
+    name: 'markdown',
+    scope: 'visitor',
+    order: 10,
+    load: 'eager',
+    gate: function (cfg) { return cfg.mdEnabled; },
+    enabled: function (cfg) { return cfg.mdEnabled; },
+    visitor: renderMarkdown
+  });
+
+
+
+  /* ================================================================ *
+   *  SNS 임베드
+   * ================================================================ */
+
+  var LABELS = { youtube: 'YouTube', twitter: 'X', instagram: 'Instagram', tiktok: 'TikTok', unknown: '' };
+
+  function bare(rawUrl) {
+    return String(rawUrl).trim().replace(/^https?:\/\//i, '').replace(/^www\./i, '');
+  }
+
+  function detectPlatform(rawUrl) {
+    var u = bare(rawUrl);
+    if (/^(youtube\.com\/(watch\?|shorts\/|embed\/|live\/|v\/)|youtu\.be\/|m\.youtube\.com\/)/i.test(u)) return 'youtube';
+    if (/^(twitter\.com|x\.com)\/[^/]+\/status(?:es)?\/\d+/i.test(u)) return 'twitter';
+    if (/^instagram\.com\/(p|reel|reels|tv)\//i.test(u)) return 'instagram';
+    if (/^(?:vm|vt)\.tiktok\.com\//i.test(u) || /^tiktok\.com\/(@[^/]+\/video\/\d+|t\/|embed\/)/i.test(u)) return 'tiktok';
+    return 'unknown';
+  }
+
+  function youtubeId(rawUrl) {
+    var u = bare(rawUrl);
+    var m = u.match(/^youtu\.be\/([\w-]{6,})/i)
+      || u.match(/[?&]v=([\w-]{6,})/i)
+      || u.match(/^(?:m\.)?youtube\.com\/(?:shorts|embed|live|v)\/([\w-]{6,})/i);
+    return m ? m[1] : null;
+  }
+
+  /** 임베드용 정규 URL — 추적/동의 파라미터 제거 (임베드 파서가 빈 박스를 만드는 원인) */
+  function canonicalUrl(rawUrl, platform) {
+    var noHash = String(rawUrl).trim().split('#')[0];
+    var path = noHash.split('?')[0];
+    var m;
+    switch (platform) {
+      case 'twitter':
+        m = bare(path).match(/^(twitter\.com|x\.com)\/([^/]+)\/status(?:es)?\/(\d+)/i);
+        return m ? 'https://' + m[1].toLowerCase() + '/' + m[2] + '/status/' + m[3] : path;
+      case 'instagram':
+        m = bare(path).match(/^instagram\.com\/(p|reel|reels|tv)\/([\w-]+)/i);
+        return m ? 'https://www.instagram.com/' + (m[1] === 'reels' ? 'reel' : m[1]) + '/' + m[2] + '/' : path;
+      case 'tiktok':
+        m = bare(path).match(/^tiktok\.com\/(@[^/]+)\/video\/(\d+)/i);
+        return m ? 'https://www.tiktok.com/' + m[1] + '/video/' + m[2] : path;
+      case 'youtube': {
+        var id = youtubeId(rawUrl);
+        return id ? 'https://www.youtube.com/watch?v=' + id : path;
+      }
+      default:
+        return path;
+    }
+  }
+
+  /** 항상 남는 하단 링크 — pill 버튼, 화살표 없음 */
+  function footLink(url, platform) {
+    var label = LABELS[platform]
+      ? t('content.media_embed.view_on', LABELS[platform] + '에서 보기').replace('{platform}', LABELS[platform])
+      : t('content.media_embed.open_link', '링크 열기');
+    return '<div class="ck5-media-embed__foot">'
+      + '<a class="ck5-media-embed__btn" href="' + esc(url) + '" target="_blank" rel="noopener noreferrer">' + esc(label) + '</a>'
+      + '</div>';
+  }
+
+  function unsupportedFallback(url) {
+    return '<div class="ck5-media-embed__notice">'
+      + esc(t('content.media_embed.unsupported', '지원하지 않는 임베드입니다. 링크로 표시합니다.'))
+      + '</div>'
+      + footLink(url, 'unknown');
+  }
+
+  function embedMarkup(platform, url, rawUrl) {
+    var m;
+    switch (platform) {
+      case 'youtube': {
+        var id = youtubeId(rawUrl);
+        if (!id) return unsupportedFallback(url);
+        var shortsClass = /\/shorts\//i.test(rawUrl) ? ' ck5-media-embed__yt--shorts' : '';
+        return '<div class="ck5-media-embed__yt' + shortsClass + '">'
+          + '<iframe src="https://www.youtube-nocookie.com/embed/' + esc(id) + '" title="YouTube video" '
+          + 'loading="lazy" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" '
+          + 'referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>'
+          + '</div>'
+          + footLink(url, platform);
+      }
+      case 'twitter':
+      case 'instagram':
+      case 'tiktok':
+        return unsupportedFallback(url);
+      default:
+        return unsupportedFallback(url);
+    }
+  }
+
+  function injectEmbedStyle(cfg) {
+    setDynamicRule('shorts', '.ck5-media-embed__yt--shorts{aspect-ratio:' + cfg.shortsRatio + ';}');
+  }
+
+  /**
+   * 임베드 대상 하나를 변환한다.
+   * @param target  교체 대상 Element (본문 <p> 블록 또는 레거시 <figure.media>/<oembed>)
+   * @param rawUrl  원본 URL
+   * @param platform  detectPlatform 결과
+   * @param cfg  설정
+   */
+  function transformEmbed(target, rawUrl, platform, cfg) {
+    if (target.parentElement && target.parentElement.classList.contains(EMBED_WRAPPER_CLASS)) return;
+
+    // 플랫폼이 꺼져 있으면: 임베드하지 않고 순수 링크로 남긴다 (레거시 <oembed> 는 <a> 로 환원).
+    if (platform !== 'unknown' && !platformEnabled(cfg, platform)) {
+      if (target.tagName === 'OEMBED' || (target.tagName === 'FIGURE' && target.classList.contains('media'))) {
+        var p = document.createElement('p');
+        var a = document.createElement('a');
+        a.href = rawUrl;
+        a.textContent = rawUrl;
+        a.target = '_blank';
+        a.rel = 'noopener noreferrer';
+        p.appendChild(a);
+        target.replaceWith(p);
+      }
+      return;
+    }
+
+    var url = canonicalUrl(rawUrl, platform);
+    var wrapper = document.createElement('div');
+    wrapper.className = EMBED_WRAPPER_CLASS;
+    wrapper.setAttribute('data-ck5-embed-platform', platform);
+    wrapper.innerHTML = embedMarkup(platform, url, rawUrl);
+    target.replaceWith(wrapper);
+
+  }
+
+  /** 플랫폼별 렌더 허용 여부 (플랫폼 마스터 토글 && 개별 토글) */
+  function platformEnabled(cfg, platform) {
+    if (!cfg.snsEnabled) return false;
+    switch (platform) {
+      case 'youtube': return cfg.snsYoutube;
+      case 'twitter': return cfg.snsTwitter;
+      case 'instagram': return cfg.snsInstagram;
+      case 'tiktok': return cfg.snsTiktok;
+      default: return false;
+    }
+  }
+
+
+
+
+  /* ================================================================ *
+   *  SNS 임베드 — 방문자 패스 · 섹션 등록
+   * ================================================================ */
+
+  var reprocessTimers = []; // 임베드 재처리 타이머 id(scan 끝에서 갱신)
+
+  /** 방문자 패스: 레거시 <oembed> 와 본문 단독 SNS 링크를 임베드로 바꾼다. */
+  function snsEmbedVisitor(scope, cfg, ctx) {
+    // 1a. 레거시 <oembed url> (previewsInData:false 로 저장됐던 형태)
+    var oembeds = scope.querySelectorAll('oembed[url]');
+    for (var i = 0; i < oembeds.length; i++) {
+      var oe = oembeds[i];
+      var rawOe = (oe.getAttribute('url') || '').trim();
+      var figure = oe.closest('figure.media');
+      var tgt = figure || oe;
+      if (tgt.parentElement && tgt.parentElement.classList.contains(EMBED_WRAPPER_CLASS)) continue;
+      if (!rawOe) { if (figure) figure.remove(); else oe.remove(); continue; }
+      var poe = detectPlatform(rawOe);
+      if (poe === 'unknown' && !cfg.linkcardEnabled) continue; // 알수없음 + 카드 꺼짐 → 그대로
+      ctx.once('embed', function () { injectEmbedStyle(cfg); });
+      transformEmbed(tgt, rawOe, poe, cfg);
+    }
+
+    // 1b. 본문 단독 SNS 링크
+    var blocks = scope.querySelectorAll('p, div');
+    for (var b = 0; b < blocks.length; b++) {
+      var block = blocks[b];
+      if (block.dataset.ck5Lc) continue;
+      if (block.closest('.ck5-linkcard, .' + EMBED_WRAPPER_CLASS)) continue;
+      var link = soleLinkOf(block);
+      if (!link) continue;
+      var raw = link.href;
+      var platform = detectPlatform(raw);
+      if (platform === 'unknown') continue; // 링크 카드 패스에서 처리
+      // SNS 로 인식된 URL 은 (임베드하든 안 하든) 링크 카드 대상에서 제외 → 처리표시
+      block.dataset.ck5Lc = 'sns';
+      ctx.once('embed', function () { injectEmbedStyle(cfg); });
+      transformEmbed(block, raw, platform, cfg);
+    }
+  }
+
+  /** 방문자 스캔 끝: 이번 스캔에서 임베드를 만들었으면 재처리 타이머를 다시 잡는다. */
+  function snsEmbedVisitorEnd(ctx) {
+    if (!ctx.has('embed')) return;
+    // 마지막 스캔 기준 2·5·10초 한 벌만 둔다(스캔마다 겹쳐 쌓이지 않게)
+    reprocessTimers.forEach(function (id) { window.clearTimeout(id); });
+    reprocessTimers = [2000, 5000, 10000].map(function (ms) { return window.setTimeout(reprocessPresent, ms); });
+  }
+
+  // SNS 패스 자체는 snsEnabled 로 막지 않는다(플랫폼별 판단은 transformEmbed 안). snsEnabled 는 게이트에만 쓴다.
+  core.section({
+    name: 'sns-embed',
+    scope: 'visitor',
+    order: 40,
+    load: 'eager',
+    gate: function (cfg) { return cfg.snsEnabled; },
+    visitor: snsEmbedVisitor,
+    visitorEnd: snsEmbedVisitorEnd
+  });
+
+
+
+  /* ================================================================ *
+   *  링크 카드
+   * ================================================================ */
+
+  var API = '/api/plugins/' + IDENTIFIER + '/link-preview';
+  var MAX_INFLIGHT = 3;
+
+  function cardHtml(url, p, cfg) {
+    var title = (p.title || p.domain || url).trim();
+    var desc = (p.description || '').trim();
+    var domain = (p.domain || '').trim();
+    var img = (p.image || '').trim();
+    var imgPart = img
+      ? '<div class="ck5-linkcard__thumb"><img src="' + esc(img) + '" alt="" loading="lazy" referrerpolicy="no-referrer"></div>'
+      : '';
+    return '<a class="ck5-linkcard' + (img ? '' : ' ck5-linkcard--noimg') + '" href="' + esc(url) + '" target="_blank" rel="noopener noreferrer nofollow">'
+      + imgPart
+      + '<div class="ck5-linkcard__body">'
+      + '<div class="ck5-linkcard__title">' + esc(title) + '</div>'
+      + (desc ? '<div class="ck5-linkcard__desc">' + esc(desc) + '</div>' : '')
+      + '<div class="ck5-linkcard__domain">' + esc(domain || url) + '</div>'
+      + '</div>'
+      + '</a>';
+  }
+
+  function minimalCardHtml(url, p) {
+    var title = (p.title || p.domain || url).trim();
+    var domain = (p.domain || '').trim();
+    var fav = (p.favicon || '').trim();
+    var favPart = fav
+      ? '<div class="ck5-linkcard__favwrap"><img class="ck5-linkcard__favicon" src="' + esc(fav) + '" alt="" referrerpolicy="no-referrer" width="18" height="18"></div>'
+      : '';
+    return '<a class="ck5-linkcard ck5-linkcard--minimal" href="' + esc(url) + '" target="_blank" rel="noopener noreferrer nofollow">'
+      + favPart
+      + '<div class="ck5-linkcard__body">'
+      + '<div class="ck5-linkcard__title">' + esc(title) + '</div>'
+      + '<div class="ck5-linkcard__domain">' + esc(domain || url) + '</div>'
+      + '</div>'
+      + '</a>';
+  }
+
+  var previewCache = {}; // url -> Preview
+  var previewPending = {}; // url -> Promise (진행 중·429 재시도 대기 중, 같은 URL 은 요청을 공유)
+  var inflight = 0;
+  var fetchQueue = [];
+  var RETRY_LATER = {};
+
+  function pump() {
+    while (inflight < MAX_INFLIGHT && fetchQueue.length > 0) {
+      (fetchQueue.shift())();
+    }
+  }
+
+  /**
+   * 429 의 Retry-After(초)로 재시도 대기 시간(ms)을 정한다. 재시도하지 않으면 null.
+   * 없음 → 2초, 10초 이하 → 그 값. 10초 초과·숫자 아님 → null. 둘 다 0~999ms 무작위 지연을 더한다.
+   */
+  function previewRetryDelay(retryAfter) {
+    var jitter = Math.floor(Math.random() * 1000);
+    if (retryAfter === null || retryAfter === undefined || String(retryAfter).trim() === '') return 2000 + jitter;
+    var v = String(retryAfter).trim();
+    if (!/^\d+$/.test(v)) return null;
+    var sec = parseInt(v, 10);
+    return sec > 10 ? null : sec * 1000 + jitter;
+  }
+
+  /** 요청 1회를 큐에 넣는다. 첫 429 는 캐시하지 않고 한 번만 다시 넣는다. */
+  function requestPreview(url, retried, finish) {
+    fetchQueue.push(function () {
+      inflight++;
+      var waitMs = null;
+      var done = function (p) {
+        inflight--;
+        finish(p);
+        pump();
+      };
+      fetch(API + '?url=' + encodeURIComponent(url), { headers: { Accept: 'application/json' } })
+        .then(function (r) {
+          if (r.status === 429 && !retried) {
+            waitMs = previewRetryDelay(r.headers.get('Retry-After'));
+            if (waitMs !== null) return RETRY_LATER;
+          }
+          return r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status));
+        })
+        .then(function (p) {
+          if (p === RETRY_LATER) {
+            inflight--;
+            pump();
+            window.setTimeout(function () { requestPreview(url, true, finish); }, waitMs);
+            return;
+          }
+          done(p && typeof p === 'object' ? p : { status: 'failed' });
+        })
+        .catch(function () { done({ status: 'failed' }); });
+    });
+    pump();
+  }
+
+  function getPreview(url) {
+    if (previewCache[url]) return Promise.resolve(previewCache[url]);
+    if (previewPending[url]) return previewPending[url];
+    previewPending[url] = new Promise(function (resolve) {
+      requestPreview(url, false, function (p) {
+        previewCache[url] = p;
+        delete previewPending[url];
+        resolve(p);
+      });
+    });
+    return previewPending[url];
+  }
+
+  function applyCard(target, url, p, kind, cfg) {
+    var usable = p.status === 'ok' || (p.status === 'minimal' && cfg.linkcardMinimal);
+    if (!usable) {
+      target.dataset.ck5Lc = 'skip'; // 원본 링크 유지 + 재시도 방지
+      return;
+    }
+    var minimal = p.status === 'minimal';
+
+    var holder = document.createElement('div');
+    holder.className = 'ck5-linkcard-wrap';
+    holder.dataset.ck5Lc = 'done';
+    holder.innerHTML = minimal ? minimalCardHtml(url, p) : cardHtml(url, p, cfg);
+
+    var cardEl = holder.querySelector('.ck5-linkcard');
+
+    var imgEl = holder.querySelector('.ck5-linkcard__thumb img');
+    if (imgEl && cardEl) {
+      var demote = function () { cardEl.classList.add('ck5-linkcard--noimg'); };
+      imgEl.addEventListener('error', demote, { once: true });
+      var to = window.setTimeout(function () {
+        if (!imgEl.complete || imgEl.naturalWidth === 0) demote();
+      }, 6000);
+      imgEl.addEventListener('load', function () {
+        window.clearTimeout(to);
+        if (imgEl.naturalWidth < 120 || imgEl.naturalHeight < 120) demote();
+      }, { once: true });
+    }
+
+    var favEl = holder.querySelector('.ck5-linkcard__favicon');
+    if (favEl) {
+      // 파비콘 칸은 CSS 로 숨겨 두고 불러오기에 성공했을 때만 보인다. 실패하면 숨긴 채로 둔다(카드 모양 불변).
+      var showFav = function () {
+        var w = favEl.closest('.ck5-linkcard__favwrap');
+        if (w && favEl.naturalWidth > 0) w.classList.add('is-loaded');
+      };
+      if (favEl.complete) showFav();
+      else favEl.addEventListener('load', showFav, { once: true });
+    }
+
+    if (kind === 'fallback') {
+      target.innerHTML = '';
+      target.appendChild(holder.firstElementChild);
+      target.dataset.ck5Lc = 'done';
+    } else {
+      target.replaceWith(holder);
+    }
+  }
+
+  function injectLinkCardStyle(cfg) {
+    var size = cfg.imageSize + 'px';
+    setDynamicRule('linkcard', '.ck5-linkcard__thumb{flex-basis:' + size + ';width:' + size + ';height:' + size + ';}.ck5-linkcard__thumb>img{width:' + size + ';height:' + size + ';}@media(max-width:520px){.ck5-linkcard__thumb{width:100%;height:' + size + ';}.ck5-linkcard__thumb>img{width:100%;height:' + size + ';}}');
+  }
+
+  /** 방문자 패스: 단독 일반 링크와 임베드 패스의 미지원 폴백 래퍼를 링크 카드로 바꾼다(SNS 패스 뒤). */
+  function linkCardVisitor(scope, cfg, ctx) {
+    var cardTargets = [];
+
+    // 2a. 본문 단독 일반 링크 (SNS 아님)
+    var lcBlocks = scope.querySelectorAll('p, div');
+    for (var k = 0; k < lcBlocks.length; k++) {
+      var lb = lcBlocks[k];
+      if (lb.dataset.ck5Lc) continue;
+      if (lb.closest('.ck5-linkcard, .' + EMBED_WRAPPER_CLASS)) continue;
+      var la = soleLinkOf(lb);
+      if (!la) continue;
+      if (detectPlatform(la.href) !== 'unknown') continue; // SNS 는 임베드 패스 소관
+      lb.dataset.ck5Lc = 'pending';
+      cardTargets.push({ url: la.href, replace: lb, kind: 'link' });
+    }
+
+    // 2b. 임베드 패스가 만든 미지원 폴백 래퍼 (레거시 <oembed> unknown 등)
+    var fbs = scope.querySelectorAll('.' + EMBED_WRAPPER_CLASS + '[data-ck5-embed-platform="unknown"]');
+    for (var f = 0; f < fbs.length; f++) {
+      var wrap = fbs[f];
+      if (wrap.dataset.ck5Lc) continue;
+      var fbLink = wrap.querySelector('a[href^="http"]');
+      if (!fbLink) continue;
+      wrap.dataset.ck5Lc = 'pending';
+      cardTargets.push({ url: fbLink.href, replace: wrap, kind: 'fallback' });
+    }
+
+    if (cardTargets.length) {
+      ctx.once('card', function () { injectLinkCardStyle(cfg); });
+      cardTargets.forEach(function (tt) {
+        getPreview(tt.url).then(function (p) {
+          if (!tt.replace.isConnected) return;
+          applyCard(tt.replace, tt.url, p, tt.kind, cfg);
+        });
+      });
+    }
+  }
+
+  core.section({
+    name: 'link-card',
+    scope: 'visitor',
+    order: 50,
+    load: 'eager',
+    gate: function (cfg) { return cfg.linkcardEnabled; },
+    enabled: function (cfg) { return cfg.linkcardEnabled; },
+    visitor: linkCardVisitor
+  });
+
+
+
+
+  function videoIdOf(url) {
+    var m = String(url || '').match(VIDEO_URL_RE);
+    return m ? m[1].toLowerCase() : null;
+  }
+
+  function videoOptionsFromUrl(url) {
+    var value = String(url || '');
+    return {
+      autoplay: /(?:[?&])autoplay=1(?:&|$)/i.test(value),
+      muted: /(?:[?&])muted=1(?:&|$)/i.test(value),
+      loop: /(?:[?&])loop=1(?:&|$)/i.test(value)
+    };
+  }
+
+  function videoUrlWithoutPlayback(url) {
+    return String(url || '')
+      .replace(/([?&])(autoplay|muted|loop)=1\b/gi, '')
+      .replace(/[?&]$/, '')
+      .replace(/\?&/, '?');
+  }
+
+  function videoUrlWithPlaybackOptions(url, options) {
+    var clean = videoUrlWithoutPlayback(url);
+    var params = [];
+    var autoplay = !!(options && options.autoplay);
+    var muted = autoplay || !!(options && options.muted);
+    if (autoplay) params.push('autoplay=1');
+    if (muted) params.push('muted=1');
+    if (options && options.loop) params.push('loop=1');
+    if (!params.length) return clean;
+    return clean + (clean.indexOf('?') === -1 ? '?' : '&') + params.join('&');
+  }
+
+  function applyVideoPlayback(video, options) {
+    var autoplay = !!(options && options.autoplay);
+    var muted = autoplay || !!(options && options.muted);
+    video.playsInline = true;
+    video.setAttribute('playsinline', '');
+    video.autoplay = autoplay;
+    video.loop = !!(options && options.loop);
+    video.muted = muted;
+    video.defaultMuted = muted;
+    if (autoplay) video.setAttribute('autoplay', '');
+    if (muted) video.setAttribute('muted', '');
+    if (video.loop) video.setAttribute('loop', '');
+  }
+
+  function startVideoPlayback(video, options, restart) {
+    if (!options || !options.autoplay || typeof video.play !== 'function') return;
+    try {
+      if (restart) video.currentTime = 0;
+      var playback = video.play();
+      if (playback && typeof playback.catch === 'function') playback.catch(function () {});
+    } catch (e) {}
+  }
+
+  function updateLoopButton(button, video) {
+    var enabled = !!video.loop;
+    var label = enabled
+      ? t('content.video.loop_off', 'Turn loop off')
+      : t('content.video.loop_on', 'Turn loop on');
+    button.setAttribute('aria-pressed', enabled ? 'true' : 'false');
+    button.setAttribute('aria-label', label);
+    button.textContent = label;
+  }
+
+  function promoteVideoAnchor(a) {
+    var url = a.getAttribute('href') || a.href || '';
+    var id = videoIdOf(url);
+    if (!id) return;
+    if (a.closest('.ck5-video')) return;
+    if (a.dataset && a.dataset.ck5Video === 'done') return;
+
+    var mime = (a.getAttribute('data-ck5-video-mime') || '').trim();
+    var srcAttr = (a.getAttribute('data-ck5-video-src') || url).trim();
+    var sizeM = url.match(/[?&]size=(sm|lg)\b/i);
+    var size = sizeM ? sizeM[1].toLowerCase() : 'md';
+    var options = videoOptionsFromUrl(url);
+
+    var wrap = document.createElement('div');
+    wrap.className = 'ck5-video';
+    wrap.setAttribute('data-ck5-video', id);
+    if (size !== 'md') wrap.setAttribute('data-size', size);
+    var videoInner = mime
+      ? '<source src="' + esc(srcAttr) + '" type="' + esc(mime) + '">'
+      : '';
+    var playbackAttrs = ' controls preload="metadata" playsinline';
+    if (options.autoplay) playbackAttrs += ' autoplay';
+    if (options.muted) playbackAttrs += ' muted';
+    if (options.loop) playbackAttrs += ' loop';
+    wrap.innerHTML =
+      '<video' + playbackAttrs + (mime ? '' : ' src="' + esc(srcAttr) + '"') + '>'
+      + videoInner
+      + '</video>'
+      + '<div class="ck5-video__foot">'
+      + '<button type="button" class="ck5-video__loop" aria-pressed="false"></button>'
+      + '<a class="ck5-video__btn" href="' + esc(url) + '" target="_blank" rel="noopener noreferrer">'
+      + esc(t('content.video.open', 'Open video source'))
+      + '</a></div>';
+    var player = wrap.querySelector('video');
+    var loopButton = wrap.querySelector('.ck5-video__loop');
+    applyVideoPlayback(player, options);
+    updateLoopButton(loopButton, player);
+    loopButton.addEventListener('click', function () {
+      var wasEnded = player.ended;
+      player.loop = !player.loop;
+      updateLoopButton(loopButton, player);
+      if (player.loop && wasEnded) startVideoPlayback(player, { autoplay: true }, true);
+    });
+
+    var block = a.closest('figure.gce-video-embed, figure.gce-video, p, div');
+    if (block && block.classList
+        && (block.classList.contains('gce-video-embed') || block.classList.contains('gce-video'))) {
+      block.replaceWith(wrap);
+      startVideoPlayback(player, options);
+      return;
+    }
+    if (block && block.parentElement) {
+      var onlyThis = (block.textContent || '').trim() === (a.textContent || '').trim()
+        && block.querySelectorAll('a, img, video, iframe').length <= 1;
+      if (onlyThis && !block.classList.contains('ck-content')) {
+        block.replaceWith(wrap);
+        startVideoPlayback(player, options);
+        return;
+      }
+    }
+    a.replaceWith(wrap);
+    startVideoPlayback(player, options);
+  }
+
+  function videoRenderVisitor(scope, cfg, ctx) {
+    var vAnchors = scope.querySelectorAll('a[href]');
+    for (var vi = 0; vi < vAnchors.length; vi++) {
+      var va = vAnchors[vi];
+      if (!videoIdOf(va.getAttribute('href') || va.href)) continue;
+      if (va.closest('.ck5-video')) continue;
+      var vblk = va.closest('p, div, figure');
+      if (vblk && vblk !== scope) vblk.dataset.ck5Lc = 'video';
+      promoteVideoAnchor(va);
+    }
+    var nativeVideos = scope.querySelectorAll('video');
+    for (var ni = 0; ni < nativeVideos.length; ni++) {
+      var nativeVideo = nativeVideos[ni];
+      var sourceNode = nativeVideo.querySelector('source[src]');
+      var source = nativeVideo.getAttribute('src') || (sourceNode && sourceNode.getAttribute('src')) || '';
+      var parsed;
+      try { parsed = new URL(source, window.location.href); } catch (e) { continue; }
+      if (parsed.origin !== window.location.origin || !/^\/api\/modules\/sirsoft-board\/boards\/[^/]+\/content-media\/[a-z0-9]{12}$/i.test(parsed.pathname)) continue;
+      if (nativeVideo.closest('.ck5-video') || nativeVideo.dataset.ck5OfficialVideo === 'done') continue;
+      nativeVideo.dataset.ck5OfficialVideo = 'done';
+      nativeVideo.playsInline = true;
+      nativeVideo.setAttribute('playsinline', '');
+      var officialWrap = document.createElement('div');
+      officialWrap.className = 'ck5-video';
+      var officialFoot = document.createElement('div');
+      officialFoot.className = 'ck5-video__foot';
+      var officialLoop = document.createElement('button');
+      officialLoop.type = 'button';
+      officialLoop.className = 'ck5-video__loop';
+      officialFoot.appendChild(officialLoop);
+      nativeVideo.parentNode.insertBefore(officialWrap, nativeVideo);
+      officialWrap.appendChild(nativeVideo);
+      officialWrap.appendChild(officialFoot);
+      updateLoopButton(officialLoop, nativeVideo);
+      officialLoop.addEventListener('click', function (video, button) {
+        return function () {
+          var ended = video.ended;
+          video.loop = !video.loop;
+          updateLoopButton(button, video);
+          if (video.loop && ended) startVideoPlayback(video, { autoplay: true }, true);
+        };
+      }(nativeVideo, officialLoop));
+    }
+  }
+
+  core.section({
+    name: 'video-render',
+    scope: 'visitor',
+    order: 30,
+    load: 'eager',
+    gate: function (cfg) { return cfg.videoEnabled; },
+    enabled: function (cfg) { return cfg.videoEnabled; },
+    visitor: videoRenderVisitor
+  });
+  /* ================================================================ *
+   *  로컬 동영상 — 편집 화면 업로드 UI (관리자)
+   * ================================================================ */
+
+  var VIDEO_INIT = '/api/plugins/' + IDENTIFIER + '/video/upload/init';
+  var VIDEO_CHUNK = '/api/plugins/' + IDENTIFIER + '/video/upload/chunk';
+  var VIDEO_COMPLETE = '/api/plugins/' + IDENTIFIER + '/video/upload/complete';
+
+  /** 설정에 따른 허용 동영상 확장자 목록 (소문자, .mp4 항상 포함) */
+  function allowedVideoExts(cfg) {
+    var e = ['mp4'];
+    if (cfg.videoAllowMov) e.push('mov');
+    if (cfg.videoAllowWebm) e.push('webm');
+    if (cfg.videoAllowM4v) e.push('m4v');
+    return e;
+  }
+
+  /** URL 에 size 힌트를 얹는다 ('md' 는 파라미터 없음 = 기본). GHS 는 href 쿼리는 보존함(실측). */
+  function videoUrlWithSize(url, size) {
+    var base = videoUrlWithoutPlayback(String(url)).replace(/[?&]size=(sm|md|lg)\b/gi, '').replace(/[?&]$/, '');
+    if (size === 'sm' || size === 'lg') {
+      base += (base.indexOf('?') === -1 ? '?' : '&') + 'size=' + size;
+    }
+    return base;
+  }
+
+  /**
+   * 동영상 링크 한 줄을 현재 커서 위치에 삽입한다.
+   * 에디터가 포커스 아웃 등으로 선택이 유효하지 않으면 **문서 끝**에 삽입(자연스러운 폴백).
+   *
+   * CKEditor 5 43.3.1 은 GHS 와일드카드로도 `<video>`·`<a class>` 를 본문 모델에 담지
+   * 못하므로(실측) 본문엔 순수 링크만. 편집 화면에선 href 속성 선택자 CSS 가 박스 카드로
+   * 보이게 하고, 방문자 화면에선 렌더러가 `<video>` 로 승격한다.
+   */
+  function insertVideoLink(editor, url, name, size, options) {
+    var u = videoUrlWithPlaybackOptions(videoUrlWithSize(url, size || 'md'), options || {});
+    var html = '<p><a href="' + esc(u) + '">' + esc(name || u) + '</a></p>';
+    var mf;
+    try {
+      mf = editor.data.toModel(editor.data.processor.toView(html));
+    } catch (e) {
+      try { editor.setData((editor.getData() || '') + html); } catch (e1) {}
+      try { editor.editing.view.focus(); } catch (e1) {}
+      return;
+    }
+    var focused = false;
+    try { focused = !!(editor.editing && editor.editing.view && editor.editing.view.document && editor.editing.view.document.isFocused); } catch (e) {}
+    try {
+      if (focused) editor.model.insertContent(mf);
+      else editor.model.insertContent(mf, editor.model.document.getRoot(), 'end');
+    } catch (e) {
+      try { editor.setData((editor.getData() || '') + html); } catch (e2) {}
+    }
+    try { editor.editing.view.focus(); } catch (e) {}
+  }
+
+  function humanMb(bytes) { return (bytes / 1024 / 1024).toFixed(1); }
+
+  /** 로그인 토큰이 있으면 Bearer 인증 헤더, 없으면 빈 객체(동영상 업로드·라이브러리 요청 공용). */
+  function authHeaders() {
+    var token = authToken();
+    return token ? { Authorization: 'Bearer ' + token } : {};
+  }
+
+  /** 파일 하나를 청크로 업로드. onProgress(0..1), 완료 시 resolve({id,url,name}). */
+  function chunkedUpload(file, cfg, onProgress) {
+    var headers = authHeaders();
+    var totalChunks = Math.max(1, Math.ceil(file.size / (cfg.videoChunkMb * 1024 * 1024)));
+
+    return fetch(VIDEO_INIT, {
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json', Accept: 'application/json' }, headers),
+      body: JSON.stringify({ filename: file.name, size: file.size, mime: file.type || 'video/mp4', total_chunks: totalChunks })
+    })
+      .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+      .then(function (res) {
+        if (!res.ok) throw new Error(res.j && res.j.message ? res.j.message : 'init 실패');
+        var sessionKey = res.j.session_key;
+        var chunkSize = res.j.chunk_size || (cfg.videoChunkMb * 1024 * 1024);
+        var count = Math.max(1, Math.ceil(file.size / chunkSize));
+
+        var sendChunk = function (index) {
+          if (index >= count) {
+            return fetch(VIDEO_COMPLETE, {
+              method: 'POST',
+              headers: Object.assign({ 'Content-Type': 'application/json', Accept: 'application/json' }, headers),
+              body: JSON.stringify({ session_key: sessionKey })
+            }).then(function (r) {
+              return r.json().then(function (j) {
+                if (!r.ok) throw new Error(j && j.message ? j.message : 'complete 실패');
+                return j;
+              });
+            });
+          }
+          var start = index * chunkSize;
+          var blob = file.slice(start, Math.min(start + chunkSize, file.size));
+          var fd = new FormData();
+          fd.append('session_key', sessionKey);
+          fd.append('index', String(index));
+          fd.append('chunk', blob, 'chunk');
+          return fetch(VIDEO_CHUNK, { method: 'POST', headers: headers, body: fd })
+            .then(function (r) {
+              return r.json().then(function (j) {
+                if (!r.ok) throw new Error(j && j.message ? j.message : 'chunk ' + index + ' 실패');
+                if (onProgress) onProgress((index + 1) / count);
+                return sendChunk(index + 1);
+              });
+            });
+        };
+        return sendChunk(0);
+      });
+  }
+
+
+
+
+  var VIDEO_META = '/api/plugins/' + IDENTIFIER + '/video/meta';
+
+  /** 편집기 컨테이너 하나에 업로드 바 + 미디어 라이브러리를 붙인다 (중복 방지). */
+  function attachUploaderTo(container) {
+    if (container.__gceVideo) return;
+    var cfg = readSettings();
+    if (!cfg.videoEnabled) return;
+    container.__gceVideo = true;
+
+    var exts = allowedVideoExts(cfg);
+    var MIME = { mp4: 'video/mp4', mov: 'video/quicktime', webm: 'video/webm' }; // 허용 확장자에 맞는 MIME 만
+    var accept = exts.map(function (x) { return '.' + x; }).concat(exts.map(function (x) { return MIME[x]; }).filter(Boolean)).join(',');
+
+    var bar = document.createElement('div');
+    bar.className = 'gce-vbar';
+    bar.innerHTML =
+      '<button type="button" class="gce-vbar__btn">' + esc(t('editor.video.button', '동영상 업로드')) + '</button>'
+      + '<span class="gce-vbar__hint">' + esc(t('editor.video.hint', '{exts} · 최대 {max}MB').replace('{exts}', exts.map(function (x) { return x.toUpperCase(); }).join('/')).replace('{max}', String(cfg.videoMaxMb))) + '</span>'
+      + '<progress class="gce-vbar__prog" max="100" value="0" hidden></progress>'
+      + '<span class="gce-vbar__msg"></span>'
+      + '<input type="file" accept="' + accept + '" hidden>';
+    try { container.parentNode.insertBefore(bar, container); } catch (e) { warnOnce('video upload bar', e); return; }
+
+    var btn = bar.querySelector('.gce-vbar__btn');
+    var input = bar.querySelector('input[type=file]');
+    var prog = bar.querySelector('.gce-vbar__prog');
+    var msg = bar.querySelector('.gce-vbar__msg');
+
+    // ---- 미디어 라이브러리 ----
+    var lib = document.createElement('div');
+    lib.className = 'gce-vlib';
+    lib.hidden = true;
+    lib.innerHTML = '<div class="gce-vlib__head">' + esc(t('editor.video.library', '동영상 라이브러리')) + '</div><div class="gce-vlib__list"></div>';
+    var libList = lib.querySelector('.gce-vlib__list');
+    try { container.parentNode.insertBefore(lib, container); } catch (e) { warnOnce('video upload bar', e); return; }
+
+    var libIndex = {}; // videoId -> card element
+
+    function currentEditor() { return editorInstanceNear(container); }
+
+    /** 라이브러리 카드 추가 (동영상 id 기준 중복 제거). */
+    function addLibCard(url, name, mime) {
+      var id = videoIdOf(url);
+      if (!id || libIndex[id]) return;
+      lib.hidden = false;
+
+      var card = document.createElement('div');
+      card.className = 'gce-vlib__card';
+      card.setAttribute('data-vid', id);
+      var baseUrl = videoUrlWithoutPlayback(videoUrlWithSize(url, 'md'));
+
+      var v = document.createElement('video');
+      v.controls = true; v.preload = 'metadata'; v.playsInline = true; v.src = baseUrl;
+      card.appendChild(v);
+
+      var nameEl = document.createElement('div');
+      nameEl.className = 'gce-vlib__name';
+      nameEl.textContent = name || id;
+      nameEl.title = name || id;
+      card.appendChild(nameEl);
+
+      var row = document.createElement('div');
+      row.className = 'gce-vlib__row';
+      var size = 'md';
+      var options = videoOptionsFromUrl(url);
+      ['sm', 'md', 'lg'].forEach(function (s) {
+        var b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'gce-vlib__sz' + (s === size ? ' is-on' : '');
+        b.textContent = t('editor.video.size_' + s, s === 'sm' ? '소' : (s === 'lg' ? '대' : '중'));
+        b.addEventListener('click', function (ev) {
+          ev.stopPropagation();
+          size = s;
+          row.querySelectorAll('.gce-vlib__sz').forEach(function (x) { x.classList.remove('is-on'); });
+          b.classList.add('is-on');
+        });
+        row.appendChild(b);
+      });
+      [
+        ['autoplay', 'editor.video.autoplay', '자동 재생'],
+        ['muted', 'editor.video.muted', '음소거'],
+        ['loop', 'editor.video.loop', '반복 재생']
+      ].forEach(function (item) {
+        var label = document.createElement('label');
+        label.className = 'gce-vlib__opt';
+        var input = document.createElement('input');
+        input.type = 'checkbox';
+        input.checked = !!options[item[0]];
+        input.setAttribute('data-option', item[0]);
+        var text = document.createElement('span');
+        text.textContent = t(item[1], item[2]);
+        label.appendChild(input);
+        label.appendChild(text);
+        input.addEventListener('change', function () {
+          options[item[0]] = input.checked;
+          if (item[0] === 'autoplay' && input.checked) {
+            options.muted = true;
+            var mutedInput = row.querySelector('input[data-option="muted"]');
+            if (mutedInput) mutedInput.checked = true;
+          }
+        });
+        row.appendChild(label);
+      });
+      var ins = document.createElement('button');
+      ins.type = 'button';
+      ins.className = 'gce-vlib__ins';
+      ins.textContent = t('editor.video.insert', '본문에 삽입');
+      var doInsert = function () {
+        var ed = currentEditor();
+        if (!ed) { msg.textContent = t('editor.video.err_editor', '에디터를 찾지 못했습니다. 잠시 후 다시 시도하세요.'); return; }
+        insertVideoLink(ed, baseUrl, name || id, size, options);
+      };
+      ins.addEventListener('click', function (ev) { ev.stopPropagation(); doInsert(); });
+      row.appendChild(ins);
+      card.appendChild(row);
+
+      libIndex[id] = card;
+      libList.appendChild(card);
+    }
+
+    /** 에디터 본문(getData)에 이미 들어 있는 동영상들을 라이브러리에 채운다 (수정 화면 대응). */
+    function hydrateFromEditor() {
+      var ed = currentEditor();
+      if (!ed) return;
+      var data = '';
+      try { data = ed.getData() || ''; } catch (e) { return; }
+      var ids = [], sourceUrls = {}, m, re = /\/api\/plugins\/glitter-ckeditor5_expansion\/video\/([a-f0-9]{32})\b/gi;
+      while ((m = re.exec(data)) !== null) {
+        var id = m[1].toLowerCase();
+        if (ids.indexOf(id) === -1 && !libIndex[id]) ids.push(id);
+      }
+      var holder = document.createElement('div');
+      holder.innerHTML = data;
+      holder.querySelectorAll('a[href]').forEach(function (anchor) {
+        var id = videoIdOf(anchor.getAttribute('href') || '');
+        if (id && !sourceUrls[id]) sourceUrls[id] = anchor.getAttribute('href');
+      });
+      if (!ids.length) return;
+      fetch(VIDEO_META, {
+        method: 'POST',
+        headers: Object.assign({ 'Content-Type': 'application/json', Accept: 'application/json' }, authHeaders()),
+        body: JSON.stringify({ ids: ids })
+      })
+        .then(function (r) { return r.ok ? r.json() : []; })
+        .then(function (list) {
+          (Array.isArray(list) ? list : []).forEach(function (it) {
+            if (it && it.url) {
+              var sourceUrl = sourceUrls[videoIdOf(it.url)] || it.url;
+              addLibCard(sourceUrl, it.name || '', it.mime || '');
+            }
+          });
+        })
+        .catch(function () {});
+    }
+    // 편집기 콘텐츠가 늦게 세팅될 수 있어 몇 차례 시도
+    [200, 800, 2000].forEach(function (ms) { window.setTimeout(hydrateFromEditor, ms); });
+
+    btn.addEventListener('click', function () { msg.textContent = ''; input.click(); });
+
+    input.addEventListener('change', function () {
+      var file = input.files && input.files[0];
+      input.value = '';
+      if (!file) return;
+      var c = readSettings();
+      var ext = (file.name.split('.').pop() || '').toLowerCase();
+      if (allowedVideoExts(c).indexOf(ext) === -1) { msg.textContent = t('editor.video.err_ext', 'MP4 파일만 업로드할 수 있습니다.'); return; }
+      if (file.size > c.videoMaxMb * 1024 * 1024) {
+        msg.textContent = t('editor.video.err_size', '파일이 너무 큽니다 (최대 {max}MB).').replace('{max}', String(c.videoMaxMb)).replace('{cur}', humanMb(file.size));
+        return;
+      }
+      var editor = currentEditor();
+      if (!editor) { msg.textContent = t('editor.video.err_editor', '에디터를 찾지 못했습니다. 잠시 후 다시 시도하세요.'); return; }
+
+      btn.disabled = true;
+      prog.hidden = false;
+      prog.value = 0;
+      var origLabel = btn.textContent;
+      btn.textContent = t('editor.video.uploading', '업로드 중…');
+
+      chunkedUpload(file, c, function (p) { prog.value = Math.round(p * 100); })
+        .then(function (r) {
+          var nm = r.name || file.name;
+          addLibCard(r.url, nm, r.mime || file.type || '');
+          insertVideoLink(editor, r.url, nm, 'md'); // 업로드 시 1회 자동 삽입 (기존 UX 유지)
+          msg.textContent = t('editor.video.done', '삽입되었습니다. 저장하면 게시글에서 재생됩니다.');
+          window.setTimeout(function () { if (msg && msg.textContent === t('editor.video.done', '삽입되었습니다. 저장하면 게시글에서 재생됩니다.')) msg.textContent = ''; }, 6000);
+        })
+        .catch(function (e) {
+          var errorMessage = e && e.message ? e.message : '';
+          msg.textContent = errorMessage === '인증이 필요합니다.'
+            ? t('editor.video.login_required', '로그인이 필요합니다.')
+            : (errorMessage || t('editor.video.err_generic', '업로드에 실패했습니다.'));
+        })
+        .then(function () {
+          btn.disabled = false;
+          btn.textContent = origLabel;
+          prog.hidden = true;
+        });
+    });
+  }
+
+  core.section({
+    name: 'video-upload',
+    scope: 'editor',
+    editorOrder: 10,
+    load: 'eager',
+    editor: attachUploaderTo
+  });
+
+
+
+
+  /* ================================================================ *
+   *  클립보드 이미지 붙여넣기 — 웹페이지 "이미지 복사" → 우리 서버 업로드
+   * ================================================================ *
+   *  CKEditor5 네이티브 ImageUpload 의 clipboardInput 리스너는(dist/vendor
+   *  ckeditor5.umd.js 실측) `dataTransfer.types` 에 `text/html` 이 있고 그
+   *  값이 비어있지 않으면 — 파일 바이너리가 함께 있어도 — 그냥 return 하고
+   *  업로드를 시도하지 않는다. 브라우저에서 웹페이지 이미지를 "이미지 복사"하면
+   *  많은 사이트가 클립보드에 실제 이미지 바이너리와 `<img src="외부URL">`
+   *  text/html 을 동시에 담으므로, 네이티브 경로로는 바이너리를 무시하고 외부
+   *  URL 이 그대로 본문에 삽입된다(화면엔 정상 렌더 → 원본 삭제/핫링크 차단 시
+   *  깨지는 조용한 실패).
+   *
+   *  여기서는 `document` 캡처 단계에서 paste 를 먼저 가로채(도달 순서상 항상
+   *  에디터 자신의 리스너보다 앞선다) 클립보드 아이템 중 kind==='file' &&
+   *  type이 'image/'로 시작하는 바이너리가 있으면, 그 즉시 htm 처리를 막고
+   *  기존 로컬 업로드 경로(SimpleUploadAdapter → sirsoft-ckeditor5 업로드
+   *  엔드포인트)를 그대로 쓰는 `uploadImage` 커맨드를 직접 실행한다. 서버로
+   *  외부 URL 을 재요청(재호스팅)하는 방식은 이전 라운드에서 사이트별로
+   *  불안정(CORS 차단·조용한 실패·우클릭 자체 차단)해 전량 롤백했으므로
+   *  이번엔 시도하지 않는다 — 바이너리가 없으면 아무 것도 하지 않고 CKEditor5
+   *  기본 동작에 맡긴다.
+   *
+   *  게시글 본문 편집기에만 적용한다. 댓글 에디터(`g7ce-wrapper` 안)는
+   *  attachPasteImageHandlerTo 에서 명시적으로 건너뛴다(업로드 경로가 없음).
+   */
+
+  var pasteImageRoots = []; // [{ domRoot, editor }]
+  var pasteImageListenerBound = false;
+
+  /** 클립보드 아이템에서 이미지 파일 바이너리만 추출한다 (없으면 빈 배열). */
+  function extractClipboardImageFiles(clipboardData) {
+    var files = [];
+    if (!clipboardData || !clipboardData.items) return files;
+    for (var i = 0; i < clipboardData.items.length; i++) {
+      var item = clipboardData.items[i];
+      if (item && item.kind === 'file' && item.type && item.type.indexOf('image/') === 0) {
+        var f = item.getAsFile();
+        if (f) files.push(f);
+      }
+    }
+    return files;
+  }
+
+  /**
+   * sirsoft-ckeditor5 관리자 설정에 실제 저장된 업로드 최대 크기(MB)를 읽는다.
+   * 서버 검증(`ImageUploadRequest`)이 이 값을 그대로 쓰므로, 클라이언트 사전
+   * 차단 기준도 임의 숫자가 아니라 이 값을 그대로 따른다.
+   */
+  function getCkeditor5MaxUploadMb() {
+    try {
+      var gs = window.G7Core.state.get();
+      var settings = (gs._global && gs._global.plugins && gs._global.plugins['sirsoft-ckeditor5'])
+        || (gs.plugins && gs.plugins['sirsoft-ckeditor5']);
+      var n = parseInt(settings && settings.imageMaxSizeMb, 10);
+      return n > 0 ? n : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /** 사용자 안내: G7Core 토스트(level = 'warning' | 'error')가 없으면 alert(이미지 업로드 기능 공용). */
+  function notify(level, msg) {
+    var toast = window.G7Core && window.G7Core.toast;
+    if (toast && typeof toast[level] === 'function') toast[level](msg);
+    else { try { window.alert(msg); } catch (e) {} }
+  }
+
+  /** 붙여넣은 파일들을 기존 로컬 이미지 업로드 경로(uploadImage 커맨드)로 넘긴다.
+   * 서버 크기 제한을 이미 넘는 파일은 업로드를 아예 시도하지 않고 즉시 안내한다
+   * (사후 타임아웃보다 나은 사용자 경험 — 불필요한 대기 자체를 없앤다).
+   */
+  function uploadPastedImages(editor, files) {
+    var maxMb = getCkeditor5MaxUploadMb();
+    var maxBytes = maxMb ? maxMb * 1024 * 1024 : null;
+    var accepted = [];
+    var rejected = [];
+    for (var i = 0; i < files.length; i++) {
+      if (maxBytes && files[i].size > maxBytes) rejected.push(files[i]);
+      else accepted.push(files[i]);
+    }
+    if (rejected.length) {
+      var msg = t('editor.image.too_large_client_check', '이미지 파일이 너무 큽니다(최대 {max}MB). 더 작은 이미지로 다시 시도해주세요.').replace('{max}', String(maxMb));
+      notify('warning', msg);
+    }
+    if (!accepted.length) return;
+    try {
+      editor.execute('uploadImage', { file: accepted });
+    } catch (e) {
+      try { console.warn('[glitter-ckeditor5_expansion] Clipboard image upload failed:', e); } catch (e2) {}
+    }
+  }
+
+  /** 붙여넣기 한 번: 등록된 편집 영역 안이고 이미지 바이너리가 있으면 가로채 업로드한다. */
+  function handleImagePaste(evt) {
+    for (var i = 0; i < pasteImageRoots.length; i++) {
+      var entry = pasteImageRoots[i];
+      if (!entry.domRoot || !entry.domRoot.isConnected || !entry.domRoot.contains(evt.target)) continue;
+
+      var cd = evt.clipboardData || (evt.originalEvent && evt.originalEvent.clipboardData);
+      var files = extractClipboardImageFiles(cd);
+      if (!files.length) return; // 바이너리 없음 → CKEditor5 기본 동작에 맡김
+
+      evt.preventDefault();
+      evt.stopPropagation();
+      if (evt.stopImmediatePropagation) evt.stopImmediatePropagation();
+      uploadPastedImages(entry.editor, files);
+      return;
+    }
+  }
+
+  /** document 캡처 단계 paste 리스너를 1회만 등록한다. 처리 중 예외는 이 기능만 건너뛴다. */
+  function ensurePasteImageListener() {
+    if (pasteImageListenerBound || typeof document === 'undefined') return;
+    pasteImageListenerBound = true;
+    document.addEventListener('paste', function (evt) {
+      try { handleImagePaste(evt); } catch (e) { warnOnce('image paste', e); }
+    }, true);
+  }
+
+  /** 편집기 컨테이너 하나를 클립보드 이미지 붙여넣기 대상으로 등록한다 (중복 방지).
+   * "이미지 복붙" 탭의 imagepaste_enabled 설정이 꺼져 있으면 등록 자체를 하지 않는다 —
+   * pasteImageRoots 에 아무 것도 안 쌓이므로 document 캡처 리스너(ensurePasteImageListener)
+   * 도 필요 없어져 결과적으로 이 플러그인의 클립보드 가로채기가 전부 비활성화되고
+   * sirsoft-ckeditor5 기본 동작(스크린샷 붙여넣기는 계속 되지만 제출 방지 가드는 빠짐,
+   * attachSubmitButtonUploadState/attachUploadTimeoutGuard 도 이 함수 안에서만 걸리므로
+   * 같이 꺼진다)으로 돌아간다. */
+  function attachPasteImageHandlerTo(container) {
+    if (container.__gcePasteImage) return;
+    var cfg = readSettings();
+    if (!cfg.imagePasteEnabled) return;
+    var editor = editorInstanceNear(container);
+    if (!editor) return;
+    var domRoot;
+    try { domRoot = editor.editing.view.getDomRoot(); } catch (e) { return; }
+    if (!domRoot) return;
+    if (domRoot.closest('.g7ce-wrapper')) return; // 댓글 편집기는 이미지 업로드 경로가 없다
+    container.__gcePasteImage = true;
+    for (var pr = pasteImageRoots.length - 1; pr >= 0; pr--) {
+      if (!pasteImageRoots[pr].domRoot || !pasteImageRoots[pr].domRoot.isConnected) pasteImageRoots.splice(pr, 1); // SPA 이동으로 끊긴 편집기 정리
+    }
+    pasteImageRoots.push({ domRoot: domRoot, editor: editor });
+    ensurePasteImageListener();
+    attachSubmitButtonUploadState(editor, domRoot);
+    attachUploadTimeoutGuard(editor);
+  }
+
+  core.section({
+    name: 'image-paste',
+    scope: 'editor',
+    editorOrder: 20,
+    load: 'eager',
+    editor: attachPasteImageHandlerTo
+  });
+
+
+
+
+  /* ================================================================ *
+   *  이미지 업로드 완료 전 "글 작성 완료" 제출 방지
+   * ================================================================ *
+   *  실측 확인(재현): 이미지 붙여넣기(클립보드 파일이든 스크린샷이든 동일) 직후
+   *  CKEditor5 는 모델에 `<img>` 를 즉시 넣지만 `src` 는 업로드가 끝나기 전까지
+   *  아예 비워둔다(`ImageUploadEditing._uploadImage` — 벤더 소스 확인). 업로드가
+   *  끝나기 전에 "글 작성 완료" 를 누르면 `editor.getData()` 가 그 순간의 상태
+   *  그대로 `<img>`(src 속성 자체가 없음)를 돌려주고, 이 사이트의 게시글 폼은
+   *  그 값을 그대로 저장한다 — 검증 결과 DB 에 `<figure class="image"><img></figure>`
+   *  로 영구 저장되어 이미지 자리가 완전히 빈칸으로 남는다(재현 성공, 게시글 id
+   *  38 로 실측). CKEditor5 는 이 상황을 위해 표준 `PendingActions` 플러그인을
+   *  이미 제공한다(`FileRepository` 가 `requires` 로 자동 로드 — 별도 플러그인
+   *  등록 불필요, 실측으로 `editor.plugins.get('PendingActions').hasAny` 가
+   *  업로드 중 `true` 로 바뀌는 것 확인). 문제는 sirsoft-board 의 게시글 폼이
+   *  이 표준 신호를 전혀 확인하지 않는다는 것(코드 전수 검색 결과 0건) — 그래서
+   *  여기서 "글 작성 완료" 버튼 클릭을 캡처 단계에서 먼저 가로채, 등록된 에디터
+   *  중 하나라도 업로드가 진행 중이면 표준 `PendingActions.hasAny` 를 근거로
+   *  제출 자체를 막는다. sirsoft-board/sirsoft-basic 폼 정의(JSON)는 수정하지
+   *  않는다(무변경 원칙) — 이 감시도 다른 슈퍼팩 기능과 동일하게 전역 스크립트의
+   *  캡처 리스너로만 구현한다. 스크린샷 붙여넣기도 동일한 업로드 파이프라인을
+   *  타므로 이 가드가 자동으로 함께 보호한다(신규 클립보드 붙여넣기 기능만의
+   *  문제가 아니라 sirsoft-ckeditor5 의 기존 구조적 공백이었음).
+   */
+
+  var submitGuardBound = false;
+
+  /** 폼 안에 등록된 에디터 중 업로드가 진행 중인 PendingActions 를 찾는다. */
+  function findPendingUploadIn(form) {
+    for (var i = 0; i < pasteImageRoots.length; i++) {
+      var entry = pasteImageRoots[i];
+      if (!entry.domRoot || !form.contains(entry.domRoot)) continue;
+      try {
+        var pa = entry.editor.plugins.get('PendingActions');
+        if (pa && pa.hasAny) return pa;
+      } catch (e) {}
+    }
+    return null;
+  }
+
+  /** document 캡처 단계에서 게시글 폼의 제출 버튼 클릭을 감시한다 (1회만 등록). */
+  function ensureSubmitGuardListener() {
+    if (submitGuardBound || typeof document === 'undefined') return;
+    submitGuardBound = true;
+    document.addEventListener('click', function (evt) {
+      var btn = evt.target && evt.target.closest ? evt.target.closest('button') : null;
+      if (!btn) return;
+      var form = btn.closest('#form');
+      if (!form) return;
+      // 게시글 폼(#form) 안의 마지막 버튼 = "등록"/"저장" 버튼 (실측 확인 —
+      // 취소·카테고리·에디터 툴바 버튼 등은 전부 그 앞에 렌더링됨).
+      var formButtons = form.querySelectorAll('button');
+      if (!formButtons.length || formButtons[formButtons.length - 1] !== btn) return;
+
+      var pending = findPendingUploadIn(form);
+      if (!pending) return; // 업로드 중인 게 없으면 그냥 통과 (정상 제출)
+
+      evt.preventDefault();
+      evt.stopPropagation();
+      if (evt.stopImmediatePropagation) evt.stopImmediatePropagation();
+
+      var msg = t('editor.image.upload_pending_submit_blocked', '이미지 업로드가 끝날 때까지 잠시만 기다려주세요. 업로드가 끝나면 다시 눌러주세요.');
+      notify('warning', msg);
+    }, true);
+  }
+
+  /* ================================================================ *
+   *  등록 버튼 "업로드중" 상태 전환 (위 제출 차단의 1차 방어로 승격)
+   * ================================================================ *
+   *  위 캡처+토스트 가드는 이제 "혹시 몰라 남겨두는" 이중 안전장치일 뿐이고,
+   *  주된 방어는 이 섹션 — 업로드 중에는 버튼 자체를 "업로드중"으로 바꾸고
+   *  비활성화해 클릭이 애초에 발생하지 않게 한다(정상 흐름에서는 위 토스트가
+   *  뜰 일이 없다 — 버튼이 이미 막혀 있으므로).
+   *
+   *  여러 이미지가 동시에 업로드 중이어도 표준 `PendingActions.hasAny` 를
+   *  그대로 신뢰한다 — `FileRepository` 는 `loaders` 컬렉션 길이가 0 으로
+   *  돌아올 때만(즉 모든 로더가 끝났을 때만) pending action 을 제거하므로,
+   *  "먼저 끝난 이미지 때문에 버튼이 풀리는" 경우는 표준 동작상 발생하지
+   *  않는다(벤더 소스 `_updatePendingAction` 확인 — 별도 카운터 불필요).
+   */
+
+  /** 폼(#form) 안에서 제출 버튼(마지막 버튼)을 찾는다. 없으면 null. */
+  function findFormSubmitButton(domRoot) {
+    var form = domRoot && domRoot.closest ? domRoot.closest('#form') : null;
+    if (!form) return null;
+    var btns = form.querySelectorAll('button');
+    return btns.length ? btns[btns.length - 1] : null;
+  }
+
+  /** 버튼 안의 문구 텍스트 노드를 담은 요소를 찾는다(아이콘과 분리된 span 우선). */
+  function findButtonLabelNode(btn) {
+    return btn.querySelector('span') || btn;
+  }
+
+  /** 제출 버튼을 PendingActions.hasAny 에 묶어 "업로드중" 상태를 전환한다 (편집기당 1회). */
+  function attachSubmitButtonUploadState(editor, domRoot) {
+    var btn = findFormSubmitButton(domRoot);
+    if (!btn || btn.__gceUploadStateBound) return;
+    btn.__gceUploadStateBound = true;
+
+    var pendingActions;
+    try { pendingActions = editor.plugins.get('PendingActions'); } catch (e) { return; }
+    if (!pendingActions) return;
+
+    var labelNode = null;
+    var originalLabel = null; // null = 현재 "업로드중" 상태가 아님 (하드코딩 금지 — 실제 버튼 원문을 저장/복원)
+
+    function onHasAny(evt, name, value) {
+      if (value) {
+        if (originalLabel === null) {
+          labelNode = findButtonLabelNode(btn);
+          originalLabel = labelNode.textContent;
+        }
+        labelNode.textContent = t('editor.image.uploading_button_label', '업로드중');
+        btn.disabled = true;
+      } else if (originalLabel !== null) {
+        var restoreLabel = originalLabel;
+        originalLabel = null;
+        window.setTimeout(function () {
+          if (pendingActions.hasAny) return;
+          var uploadingLabel = t('editor.image.uploading_button_label', '업로드중');
+          if (labelNode && labelNode.textContent === uploadingLabel) labelNode.textContent = restoreLabel;
+          btn.disabled = false;
+        }, 0);
+      }
+    }
+    try { pendingActions.on('change:hasAny', onHasAny); } catch (e) { warnOnce('upload state', e); }
+  }
+
+  /* ================================================================ *
+   *  업로드 멈춤(영구 pending) 안전장치 — 강제 타임아웃
+   * ================================================================ *
+   *  실측 확인: 3.7MB~8MB대 이미지를 실제로 붙여넣으면 서버 크기 제한
+   *  (`imageMaxSizeMb`, 이 사이트는 50MB로 충분히 여유 — 크기 제한에 걸린
+   *  게 아님)에는 안 걸리는데도 업로드가 끝나지도 실패하지도 않고 무한정
+   *  멈춘다. 원인을 추적한 결과 — php-fpm 워커는 전부 idle(sleeping) 상태로
+   *  실제 처리 중이 아니었고, Laravel 로그에도 해당 요청이 전혀 기록되지
+   *  않았으며, Cloudflare Tunnel(cloudflared) 로그에 해당 업로드 요청마다
+   *  `"Incoming request ended abruptly: context canceled"` 가 정확히 대응되는
+   *  것을 확인했다 — 즉 서버(PHP)가 멈춘 게 아니라 **클라이언트→오리진 전송이
+   *  중간에 끊기고, XHR 이 그 상태에서 load/error 이벤트를 받지 못해 영원히
+   *  대기하는 것**이 근본 원인으로 보인다(정확한 원인 계층 — 터널/네트워크
+   *  구간의 문제로 추정 — 은 이 플러그인의 코드 범위 밖이라 이번엔 근본
+   *  차단 대신 클라이언트 타임아웃으로 사용자를 무한 대기에서 반드시
+   *  풀어주는 안전장치를 넣는다).
+   *
+   *  `FileRepository.loaders` 컬렉션 레벨에서 건다 — 이 컬렉션은 트리거가
+   *  클립보드 붙여넣기든 스크린샷 붙여넣기든 에디터의 다른 업로드 경로든
+   *  전부 공유하므로, 이 안전장치는 자동으로 모든 업로드 경로에 공통 적용된다.
+   *
+   *  **실측으로 드러난 추가 함정**: 벤더 `Loader.abort()`는 상태를 `aborted`로
+   *  바꾸고 어댑터의 `xhr.abort()`를 호출할 뿐 — 실제 정리(모델에서 이미지
+   *  제거, `FileRepository.loaders`에서 제거, `PendingActions` 해제)는 그
+   *  `xhr`가 비동기로 발화하는 네이티브 `abort` 이벤트를 CKEditor5 내부
+   *  `ImageUploadEditing._readAndUpload`의 프라미스 체인이 받아야만 일어난다.
+   *  이 사이트의 실제 정체 상황(업로드 바디는 100% 전송 완료됐지만 서버
+   *  응답이 영영 안 오는 상태 — Cloudflare Tunnel 쪽 절단으로 추정)에서는
+   *  **`xhr.abort()`를 호출해도 그 네이티브 `abort` 이벤트가 발화하지 않는
+   *  것을 직접 재현·확인했다**(`loader.abort()`를 수동 호출한 뒤 여러 초를
+   *  기다려도 `loaders.length`가 줄지 않고 `PendingActions.hasAny`도 계속
+   *  `true`로 남음). 그래서 이 타임아웃 가드는 `loader.abort()` 호출에만
+   *  기대지 않고, 그 비동기 콜백이 안 와도 사용자가 절대 갇히지 않도록
+   *  **모델의 이미지 요소 제거 + `FileRepository.destroyLoader()` 호출을
+   *  우리가 직접, 그 자리에서 수행**한다(둘 다 CKEditor5가 공개하는 표준
+   *  API — 내부 전용 메서드를 억지로 파고든 게 아니다).
+   */
+
+  /** 업로드 하나가 이 시간(ms) 안에 끝나지 않으면 강제로 정리한다.
+   * 서버 fastcgi_read_timeout(600s)보다 훨씬 짧게 잡아, 사용자가 실제로
+   * 체감하기 전에 안내와 함께 풀어준다. */
+  var UPLOAD_STUCK_TIMEOUT_MS = 45000;
+
+  /** 모델에서 이 uploadId 를 가진 이미지 요소를 찾아 제거한다(있으면). */
+  function removeStuckUploadImageElement(editor, uploadId) {
+    var root = editor.model.document.getRoot();
+    var target = null;
+    var walker = editor.model.createRangeIn(root).getWalker({ ignoreElementEnd: true });
+    for (var step = walker.next(); !step.done; step = walker.next()) {
+      var value = step.value;
+      var item = value.item;
+      if (item.getAttribute && item.getAttribute('uploadId') === uploadId) {
+        target = item;
+        break;
+      }
+    }
+    if (target) {
+      editor.model.change(function (writer) { writer.remove(target); });
+    }
+  }
+
+  /** 편집기 하나의 FileRepository 에 강제 타임아웃 가드를 붙인다(편집기당 1회). */
+  function attachUploadTimeoutGuard(editor) {
+    if (editor.__gceUploadTimeoutGuard) return;
+    editor.__gceUploadTimeoutGuard = true;
+
+    var fileRepo;
+    try { fileRepo = editor.plugins.get('FileRepository'); } catch (e) { return; }
+    if (!fileRepo) return;
+
+    fileRepo.loaders.on('add', function (evt, loader) {
+      var settled = false;
+
+      var timer = window.setTimeout(function () {
+        if (settled) return;
+        settled = true;
+
+        try { loader.abort(); } catch (e) {}
+        // xhr.abort() 의 비동기 콜백을 기다리지 않고 즉시 직접 정리한다
+        // (위 주석 — 이 환경에서 그 콜백이 오지 않는 경우를 실측 확인).
+        try { removeStuckUploadImageElement(editor, loader.id); } catch (e) {}
+        try { fileRepo.destroyLoader(loader); } catch (e) {}
+
+        var msg = t('editor.image.upload_timeout', '이미지 업로드가 너무 오래 걸려 취소되었습니다. 파일 크기나 네트워크 상태를 확인한 뒤 다시 시도해주세요.');
+        notify('error', msg);
+      }, UPLOAD_STUCK_TIMEOUT_MS);
+
+      function onRemoved(evt2, removedItem) {
+        if (removedItem !== loader) return;
+        settled = true;
+        window.clearTimeout(timer);
+        fileRepo.loaders.off('remove', onRemoved);
+      }
+      fileRepo.loaders.on('remove', onRemoved);
+    });
+  }
+
+  // 제출 가드는 컨테이너마다 불리지만 document 리스너는 한 번만 건다(submitGuardBound).
+  core.section({
+    name: 'upload-guards',
+    scope: 'editor',
+    editorOrder: 30,
+    load: 'eager',
+    editor: ensureSubmitGuardListener
+  });
+
+
+
+
+  /* ================================================================ *
+   *  에디터 스타일 — 본문 기본 글자크기·줄간격 (전역, 기본은 댓글 제외)
+   * ================================================================ *
+   *  - **게시글 본문(방문자 화면)**: `.ck-content.prose` — sirsoft-board 의
+   *    `html_content` 확장 포인트가 붙이는 클래스 조합.
+   *  - **댓글(방문자 화면)**: 댓글은 `.ck-content`/`prose` 경로를 전혀 타지 않는다
+   *    (재조사 확인).
+   *    sirsoft-board 코어 댓글 API 에는 `content_mode` 필드가 없어 댓글 본문은 항상
+   *    `<p class="text-gray-700 dark:text-gray-300">…</p>` 로 text 바인딩(HTML
+   *    이스케이프) 렌더링된다. 실제로 굵게·목록·표 등 서식이 보이는 것은
+   *    g7-comment-editor 의 `upgradeRenderedComments()` 가 전역에서
+   *    `p.text-gray-700` + `dark:text-gray-300` 조합을 스캔해 새니타이즈된 HTML 로
+   *    `innerHTML` 승격시키는, sirsoft-board 렌더링과는 완전히 별개인 후처리
+   *    경로 때문이다(승격 후에도 클래스는 그대로 `text-gray-700 dark:text-gray-300`
+   *    이며 `ck-content`/`prose` 계열 클래스는 붙지 않음, 실브라우저 DOM 확인).
+   *    따라서 `editor_apply_to_comments` 설정이 켜지면 g7-comment-editor 자신이
+   *    승격 대상 판별에 쓰는 것과 동일한 조합인 `p.text-gray-700.dark\:text-gray-300`
+   *    셀렉터를 규칙에 추가한다 — CSS는 DOM 클래스 기준으로 적용되므로 그 클래스를
+   *    어느 플러그인이 렌더링/승격했는지는 무관하다(슈퍼팩·g7-comment-editor 어느
+   *    쪽 파일도 건드리지 않음).
+   *  - **편집 화면**: 표식은 CKEditor 가 관리하지 않는 **바깥 컨테이너**에 붙이고,
+   *    CSS 는 그 아래 `.ck-editor__editable` 에 건다. 편집 루트(`getDomRoot()`)에
+   *    직접 붙이면 CKEditor 렌더러가 포커스 전환 때 루트 class 를 다시 써서 표식이
+   *    지워진다(1.5.0 에서 고침).
+   *    - 게시글 본문 에디터: `div.ckeditor5-wrapper` (sirsoft-ckeditor5
+   *      `html-editor.json` 의 고정 className 컨테이너, 편집기는 그 안에 생성)
+   *    - 댓글 에디터: `div.g7ce-wrapper` (g7-comment-editor 가 만드는 컨테이너).
+   *      "댓글에도 적용" 옵션이 켜져 있을 때만 붙인다.
+   *    컨테이너는 안에 `.ck-editor__editable` 이 있을 때만 대상이다.
+   *
+   */
+
+  var EDITOR_STYLE_MARKER = 'gce-body-editor-style';
+  var COMMENT_EDITOR_STYLE_MARKER = 'gce-comment-editor-style';
+  function injectEditorStyleCss(cfg) {
+    document.documentElement.classList.toggle('gce-editor-style-enabled', cfg.editorStyleEnabled);
+    document.documentElement.classList.toggle('gce-editor-apply-comments', cfg.editorStyleEnabled && cfg.editorApplyToComments);
+    if (!cfg.editorStyleEnabled) { setDynamicRule('editor', ''); return; }
+    var selectors = ['html.gce-editor-style-enabled .ck-content.prose', 'html.gce-editor-style-enabled .' + EDITOR_STYLE_MARKER + ' .ck-editor__editable', 'html.gce-editor-style-enabled .' + COMMENT_EDITOR_STYLE_MARKER + ' .ck-editor__editable'];
+    if (cfg.editorApplyToComments) selectors.push('html.gce-editor-apply-comments p.text-gray-700.dark\\:text-gray-300');
+    var rule = 'font-size:' + cfg.editorFontSize + 'px!important;line-height:' + cfg.editorLineHeight + '!important;';
+    setDynamicRule('editor', selectors.join(',') + '{' + rule + '}');
+  }
+
+  /** 편집기 바깥 컨테이너에 표식 클래스를 붙이거나 뗀다(안에 편집 영역이 있을 때만 붙임). */
+  function markEditorContainers(selector, marker, enabled) {
+    var list = document.querySelectorAll(selector);
+    for (var i = 0; i < list.length; i++) {
+      var want = enabled && !!list[i].querySelector('.ck-editor__editable');
+      if (list[i].classList.contains(marker) !== want) list[i].classList.toggle(marker, want);
+    }
+  }
+
+  /** 본문 에디터·댓글 에디터 컨테이너의 표식을 설정에 맞춘다(멱등). */
+  function applyEditorStyleMarkers() {
+    var cfg = readSettings();
+    var on = !!cfg.editorStyleEnabled;
+    markEditorContainers('div.ckeditor5-wrapper', EDITOR_STYLE_MARKER, on);
+    markEditorContainers('div.g7ce-wrapper', COMMENT_EDITOR_STYLE_MARKER, on && !!cfg.editorApplyToComments);
+  }
+
+  core.section({
+    name: 'editor-style',
+    scope: 'editor',
+    load: 'eager',
+    boot: injectEditorStyleCss,
+    editorEnd: applyEditorStyleMarkers
+  });
+
+
+
+
+  /* ================================================================ *
+   *  코드 서식 — 본문 에디터에 인라인 코드·코드 블록 버튼 (1.5.0)
+   * ================================================================ *
+   *  - sirsoft-ckeditor5 를 고치지 않고, 설치된 CKEditor 빌드의 Code·CodeBlock 플러그인을
+   *    **게시글 본문 에디터에만** 넣는다. sirsoft 는 `extraPlugins` 를 넘기지 않고, 플러그인은
+   *    생성 뒤에 더할 수 없으므로 `ClassicEditor.create` 를 감싸 config 복사본에 더한다.
+   *  - UMD 는 `window.CKEDITOR = {}` 를 먼저 대입하고 `exports.ClassicEditor = …` 를 나중에
+   *    채운다. 그래서 `window.CKEDITOR` 대입과 그 객체의 `ClassicEditor` 대입을 접근자로 잡아
+   *    감싼다(이미 로드돼 있으면 바로 감싼다). g7-comment-editor 는 같은 ClassicEditor 를
+   *    쓰지만, 대상 요소가 `.ckeditor5-wrapper` 안이 아니므로 건드리지 않는다.
+   *  - 어떤 예외도 에디터 생성을 막지 않는다: 원래 config 로 넘기고 console.warn 을 한 번만.
+   *  - 저장된 코드의 표시 스타일은 설정과 무관하게 항상 넣는다(끄더라도 기존 글의 코드는 보여야 함).
+   *    마크다운 변환 코드(`code[data-ck5-mdc]`, `pre.ck5-md-pre`)도 같은 규칙을 쓴다(1.6.0, 툴바 코드 모양).
+   *    툴바 선택자는 그대로 두고 규칙마다 마크다운 선택자를 뒤에 더한다(툴바 쪽 우선순위를 바꾸지 않으려고).
+   */
+
+  var CODE_WRAPPER_MARKER = '__glitterCkeditor5ExpansionCodeWrapped';
+  var codeFormatWarned = false;
+
+  function codeFormatWarn(reason) {
+    if (codeFormatWarned) return;
+    codeFormatWarned = true;
+    try { console.warn('[' + IDENTIFIER + '] code formatting disabled: ' + (reason && reason.message ? reason.message : reason)); } catch (e) {}
+  }
+
+  /** 툴바 항목 복사본에 name 을 after 바로 뒤(없으면 끝)에 넣는다. 이미 있으면 그대로. */
+  function insertToolbarItem(items, name, after) {
+    if (items.indexOf(name) !== -1) return;
+    var i = items.indexOf(after);
+    if (i === -1) items.push(name);
+    else items.splice(i + 1, 0, name);
+  }
+
+  /** 본문 에디터면 Code·CodeBlock·툴바 항목을 더한 config 복사본을, 아니면 원래 cfg 를 돌려준다. */
+  function codeFormatConfig(el, cfg) {
+    if (!codeFormatEnabled()) return cfg;
+    if (!el || !el.closest || !el.closest('.ckeditor5-wrapper')) return cfg;
+    var CK = window.CKEDITOR;
+    if (!CK || !CK.Code || !CK.CodeBlock) { codeFormatWarn('Code/CodeBlock not found in the CKEditor build'); return cfg; }
+    if (!cfg || !Array.isArray(cfg.plugins) || !cfg.toolbar || !Array.isArray(cfg.toolbar.items)) { codeFormatWarn('unexpected editor config'); return cfg; }
+
+    var extra = [];
+    if (cfg.plugins.indexOf(CK.Code) === -1) extra.push(CK.Code);
+    var addBlock = cfg.plugins.indexOf(CK.CodeBlock) === -1;
+    if (addBlock) extra.push(CK.CodeBlock);
+
+    var items = cfg.toolbar.items.slice();
+    insertToolbarItem(items, 'code', 'strikethrough');
+    insertToolbarItem(items, 'codeBlock', 'blockQuote');
+
+    var next = Object.assign({}, cfg, {
+      extraPlugins: (Array.isArray(cfg.extraPlugins) ? cfg.extraPlugins : []).concat(extra),
+      toolbar: Object.assign({}, cfg.toolbar, { items: items })
+    });
+    // CKEditor 는 'Plain text' 라벨을 스스로 번역한다(ko: 평문). 이미 CodeBlock 이 있는 프리셋은 언어 설정도 그대로 둔다.
+    if (addBlock && !cfg.codeBlock) next.codeBlock = { languages: [{ language: 'plaintext', label: 'Plain text' }] };
+    return next;
+  }
+
+  function wrapClassicEditor(C) {
+    if (!C || C[CODE_WRAPPER_MARKER] || typeof C.create !== 'function') return;
+    var original = C.create;
+    try {
+      C.create = function (el, cfg) {
+        var next = cfg;
+        try { next = codeFormatConfig(el, cfg); } catch (e) { codeFormatWarn(e); next = cfg; }
+        return original.call(this, el, next);
+      };
+      C[CODE_WRAPPER_MARKER] = true;
+    } catch (e) { codeFormatWarn(e); }
+  }
+
+  /** UMD exports 객체: ClassicEditor 가 있으면 바로, 나중에 대입되면 그때 감싼다. */
+  function watchCkeditorExports(ck) {
+    if (!ck || typeof ck !== 'object') return;
+    var current = ck.ClassicEditor;
+    if (current) wrapClassicEditor(current);
+    var d = Object.getOwnPropertyDescriptor(ck, 'ClassicEditor');
+    if (d && d.configurable === false) return;
+    Object.defineProperty(ck, 'ClassicEditor', {
+      configurable: true,
+      enumerable: true,
+      get: function () { return current; },
+      set: function (v) { current = v; wrapClassicEditor(v); }
+    });
+  }
+
+  function installCodeFormatHook() {
+    try {
+      var current = window.CKEDITOR;
+      if (current) watchCkeditorExports(current);
+      var d = Object.getOwnPropertyDescriptor(window, 'CKEDITOR');
+      if (d && d.configurable === false) return;
+      Object.defineProperty(window, 'CKEDITOR', {
+        configurable: true,
+        enumerable: true,
+        get: function () { return current; },
+        set: function (v) {
+          current = v;
+          try { watchCkeditorExports(v); } catch (e) { codeFormatWarn(e); }
+        }
+      });
+    } catch (e) { codeFormatWarn(e); }
+  }
+
+  // install 은 등록 즉시(= 번들 평가 중 이 자리) 실행된다. 대입 훅은 CKEditor UMD 보다 먼저 걸려야 한다.
+  core.section({
+    name: 'code-format',
+    scope: 'editor',
+    load: 'eager',
+    install: function () {
+      installCodeFormatHook();
+    }
+  });
+
+
+
+
+  /* ================================================================ *
+   *  코드 블록 복사 버튼 — 방문자 본문 (1.5.0)
+   * ================================================================ *
+   *  - 방문자 본문(`.ck-content`)의 모든 `pre`(툴바 코드 블록·마크다운 ``` 코드 블록) 오른쪽
+   *    위에 반투명 복사 버튼을 단다. 인라인 코드에는 달지 않는다. `codeformat_enabled` 와
+   *    무관하게 항상 단다(기존 글의 코드 블록도 복사할 수 있어야 함).
+   *  - 편집 영역(`.ck-editor__editable` 도 `.ck-content`)·댓글 편집기는 제외한다. 버튼이
+   *    편집 모델에 섞여 저장되면 안 되기 때문이다.
+   *  - 별도 감시기·타이머 없이 기존 `scan()` 경로에서 부른다. 이미 버튼이 있는 `pre` 는
+   *    건너뛰므로 반복 호출해도 같다. 기존 노드를 옮기거나 감싸지 않고 버튼만 `pre` 첫
+   *    자식으로 넣는다.
+   *  - `position: sticky` 는 `pre` 콘텐츠 상자를 벗어나지 못해 가로 스크롤 시 밀려난다.
+   *    그래서 절대 위치 + `pre` 의 scroll 이벤트에서 `translateX(scrollLeft)` 로 되돌린다.
+   */
+
+  var CODE_COPY_DONE_MS = 1500;
+  var codeCopyWarned = false;
+
+  var COPY_ICON = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">'
+    + '<rect x="9" y="9" width="12" height="12" rx="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>';
+  var CHECK_ICON = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">'
+    + '<polyline points="20 6 9 17 4 12"></polyline></svg>';
+
+  function codeCopyWarn(reason) {
+    if (codeCopyWarned) return;
+    codeCopyWarned = true;
+    try { console.warn('[' + IDENTIFIER + '] code copy failed: ' + (reason && reason.message ? reason.message : reason)); } catch (e) {}
+  }
+
+  /** 언어 파일에 키가 없으면 문서 언어(ko 여부)로 대체 문구를 고른다. */
+  function codeCopyLabel(done) {
+    var lang = (document.documentElement.getAttribute('lang') || '').toLowerCase();
+    var ko = lang.indexOf('ko') === 0;
+    return done
+      ? t('content.code_copy.done', ko ? '복사됨' : 'Copied')
+      : t('content.code_copy.label', ko ? '코드 복사' : 'Copy code');
+  }
+
+  /** 복사할 텍스트: 직계 `code` 가 있으면 그 글자, 없으면 버튼을 뺀 `pre` 글자. */
+  function codeCopyText(pre) {
+    for (var i = 0; i < pre.children.length; i++) {
+      if (pre.children[i].tagName === 'CODE') return pre.children[i].textContent;
+    }
+    var clone = pre.cloneNode(true);
+    var btns = clone.querySelectorAll('.gce-copy-btn, .ck5sp-copy-btn');
+    for (var j = 0; j < btns.length; j++) btns[j].parentNode.removeChild(btns[j]);
+    return clone.textContent;
+  }
+
+  function copyByTextarea(text) {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.className = 'gce-copy-textarea';
+    document.body.appendChild(ta);
+    var ok = false;
+    try {
+      ta.select();
+      ok = document.execCommand('copy');
+    } catch (e) { ok = false; }
+    document.body.removeChild(ta);
+    return ok;
+  }
+
+  function copyCodeText(text, done) {
+    var fallback = function (why) {
+      if (copyByTextarea(text)) done();
+      else codeCopyWarn(why || 'execCommand copy returned false');
+    };
+    var clip = navigator.clipboard;
+    if (clip && typeof clip.writeText === 'function') {
+      try {
+        clip.writeText(text).then(done, function (err) { fallback(err); });
+        return;
+      } catch (e) { /* 아래 대체 경로 */ }
+    }
+    fallback();
+  }
+
+  function showCodeCopied(btn) {
+    btn.setAttribute('data-state', 'done');
+    btn.setAttribute('aria-label', codeCopyLabel(true));
+    btn.innerHTML = CHECK_ICON;
+    clearTimeout(btn._gceCopyTimer);
+    btn._gceCopyTimer = setTimeout(function () {
+      btn.removeAttribute('data-state');
+      btn.setAttribute('aria-label', codeCopyLabel(false));
+      btn.innerHTML = COPY_ICON;
+    }, CODE_COPY_DONE_MS);
+  }
+
+  function attachCodeCopyButton(pre) {
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'gce-copy-btn ck5sp-copy-btn';
+    btn.setAttribute('aria-label', codeCopyLabel(false));
+    btn.innerHTML = COPY_ICON;
+    btn.addEventListener('click', function (ev) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      copyCodeText(codeCopyText(pre), function () { showCodeCopied(btn); });
+    });
+    pre.setAttribute('data-ck5sp-copy', '1');
+    pre.insertBefore(btn, pre.firstChild);
+  }
+
+  /** 방문자 본문의 코드 블록마다 복사 버튼을 단다(이미 있으면 건너뜀). */
+  function addCodeCopyButtons(root) {
+    var pres;
+    try { pres = (root || document).querySelectorAll('pre'); } catch (e) { return; }
+    if (!pres.length) return;
+    for (var i = 0; i < pres.length; i++) {
+      var pre = pres[i];
+      if (!pre.closest('.ck-content')) continue;
+      if (pre.closest('.ck-editor__editable, .ck-editor, .g7ce-wrapper')) continue;
+      if (pre.querySelector(':scope > .gce-copy-btn, :scope > .ck5sp-copy-btn')) continue;
+      try { attachCodeCopyButton(pre); } catch (e) { codeCopyWarn(e); }
+    }
+  }
+
+  // 게이트 없음: 다른 방문자 기능이 모두 꺼져 있어도 root 에 한 번 돈다(코드 복사는 설정 없이 항상 켜짐).
+  core.section({
+    name: 'code-copy',
+    scope: 'visitor',
+    order: 20,
+    load: 'eager',
+    visitor: addCodeCopyButtons
+  });
+
+
+
+
+  // 코어 ActionDispatcher 가 있으면 수동 트리거용 핸들러도 등록 (레이아웃 onMount 등에서 호출 가능)
+  function registerHandlers(retry) {
+    var dispatcher = window.G7Core && window.G7Core.getActionDispatcher && window.G7Core.getActionDispatcher();
+    if (dispatcher) {
+      dispatcher.registerHandler(IDENTIFIER + '.render', function () { scan(document); }, { category: 'plugin', source: IDENTIFIER });
+      return;
+    }
+    if (!retry) return;
+    var tries = 0;
+    var timer = window.setInterval(function () {
+      var d = window.G7Core && window.G7Core.getActionDispatcher && window.G7Core.getActionDispatcher();
+      if (d) {
+        d.registerHandler(IDENTIFIER + '.render', function () { scan(document); }, { category: 'plugin', source: IDENTIFIER });
+        window.clearInterval(timer);
+      } else if (++tries >= 50) {
+        window.clearInterval(timer);
+      }
+    }, 100);
+  }
+
+  function init() {
+    registerHandlers(true);
+    run();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init, { once: true });
+  } else {
+    init();
+  }
+
+  window.GlitterCkeditor5Expansion = { rescan: function () { scan(document); } };
+
+
+})();
+
+

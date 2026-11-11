@@ -1,0 +1,116 @@
+  /* ================================================================ *
+   *  로컬 동영상 — 편집 화면 업로드 UI (관리자)
+   * ================================================================ */
+
+  var VIDEO_INIT = '/api/plugins/' + IDENTIFIER + '/video/upload/init';
+  var VIDEO_CHUNK = '/api/plugins/' + IDENTIFIER + '/video/upload/chunk';
+  var VIDEO_COMPLETE = '/api/plugins/' + IDENTIFIER + '/video/upload/complete';
+
+  /** 설정에 따른 허용 동영상 확장자 목록 (소문자, .mp4 항상 포함) */
+  function allowedVideoExts(cfg) {
+    var e = ['mp4'];
+    if (cfg.videoAllowMov) e.push('mov');
+    if (cfg.videoAllowWebm) e.push('webm');
+    if (cfg.videoAllowM4v) e.push('m4v');
+    return e;
+  }
+
+  /** URL 에 size 힌트를 얹는다 ('md' 는 파라미터 없음 = 기본). GHS 는 href 쿼리는 보존함(실측). */
+  function videoUrlWithSize(url, size) {
+    var base = videoUrlWithoutPlayback(String(url)).replace(/[?&]size=(sm|md|lg)\b/gi, '').replace(/[?&]$/, '');
+    if (size === 'sm' || size === 'lg') {
+      base += (base.indexOf('?') === -1 ? '?' : '&') + 'size=' + size;
+    }
+    return base;
+  }
+
+  /**
+   * 동영상 링크 한 줄을 현재 커서 위치에 삽입한다.
+   * 에디터가 포커스 아웃 등으로 선택이 유효하지 않으면 **문서 끝**에 삽입(자연스러운 폴백).
+   *
+   * CKEditor 5 43.3.1 은 GHS 와일드카드로도 `<video>`·`<a class>` 를 본문 모델에 담지
+   * 못하므로(실측) 본문엔 순수 링크만. 편집 화면에선 href 속성 선택자 CSS 가 박스 카드로
+   * 보이게 하고, 방문자 화면에선 렌더러가 `<video>` 로 승격한다.
+   */
+  function insertVideoLink(editor, url, name, size, options) {
+    var u = videoUrlWithPlaybackOptions(videoUrlWithSize(url, size || 'md'), options || {});
+    var html = '<p><a href="' + esc(u) + '">' + esc(name || u) + '</a></p>';
+    var mf;
+    try {
+      mf = editor.data.toModel(editor.data.processor.toView(html));
+    } catch (e) {
+      try { editor.setData((editor.getData() || '') + html); } catch (e1) {}
+      try { editor.editing.view.focus(); } catch (e1) {}
+      return;
+    }
+    var focused = false;
+    try { focused = !!(editor.editing && editor.editing.view && editor.editing.view.document && editor.editing.view.document.isFocused); } catch (e) {}
+    try {
+      if (focused) editor.model.insertContent(mf);
+      else editor.model.insertContent(mf, editor.model.document.getRoot(), 'end');
+    } catch (e) {
+      try { editor.setData((editor.getData() || '') + html); } catch (e2) {}
+    }
+    try { editor.editing.view.focus(); } catch (e) {}
+  }
+
+  function humanMb(bytes) { return (bytes / 1024 / 1024).toFixed(1); }
+
+  /** 로그인 토큰이 있으면 Bearer 인증 헤더, 없으면 빈 객체(동영상 업로드·라이브러리 요청 공용). */
+  function authHeaders() {
+    var token = authToken();
+    return token ? { Authorization: 'Bearer ' + token } : {};
+  }
+
+  /** 파일 하나를 청크로 업로드. onProgress(0..1), 완료 시 resolve({id,url,name}). */
+  function chunkedUpload(file, cfg, onProgress) {
+    var headers = authHeaders();
+    var totalChunks = Math.max(1, Math.ceil(file.size / (cfg.videoChunkMb * 1024 * 1024)));
+
+    return fetch(VIDEO_INIT, {
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json', Accept: 'application/json' }, headers),
+      body: JSON.stringify({ filename: file.name, size: file.size, mime: file.type || 'video/mp4', total_chunks: totalChunks })
+    })
+      .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+      .then(function (res) {
+        if (!res.ok) throw new Error(res.j && res.j.message ? res.j.message : 'init 실패');
+        var sessionKey = res.j.session_key;
+        var chunkSize = res.j.chunk_size || (cfg.videoChunkMb * 1024 * 1024);
+        var count = Math.max(1, Math.ceil(file.size / chunkSize));
+
+        var sendChunk = function (index) {
+          if (index >= count) {
+            return fetch(VIDEO_COMPLETE, {
+              method: 'POST',
+              headers: Object.assign({ 'Content-Type': 'application/json', Accept: 'application/json' }, headers),
+              body: JSON.stringify({ session_key: sessionKey })
+            }).then(function (r) {
+              return r.json().then(function (j) {
+                if (!r.ok) throw new Error(j && j.message ? j.message : 'complete 실패');
+                return j;
+              });
+            });
+          }
+          var start = index * chunkSize;
+          var blob = file.slice(start, Math.min(start + chunkSize, file.size));
+          var fd = new FormData();
+          fd.append('session_key', sessionKey);
+          fd.append('index', String(index));
+          fd.append('chunk', blob, 'chunk');
+          return fetch(VIDEO_CHUNK, { method: 'POST', headers: headers, body: fd })
+            .then(function (r) {
+              return r.json().then(function (j) {
+                if (!r.ok) throw new Error(j && j.message ? j.message : 'chunk ' + index + ' 실패');
+                if (onProgress) onProgress((index + 1) / count);
+                return sendChunk(index + 1);
+              });
+            });
+        };
+        return sendChunk(0);
+      });
+  }
+
+
+
+

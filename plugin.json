@@ -1,0 +1,36 @@
+{
+    "identifier": "glitter-ckeditor5_expansion",
+    "vendor": "Glitter.kr",
+    "name": {
+        "ko": "Glitter CKEditor5 확장",
+        "en": "Glitter CKEditor5 Expansion"
+    },
+    "version": "0.1.7",
+    "license": "MIT",
+    "description": {
+        "ko": "CKEditor 5에 SNS 임베드, 외부 링크 카드, HTML5 동영상 업로드 및 자동·음소거·반복 재생 제어, 마크다운 렌더링, 에디터 서식, 이미지 >붙여넣기 및 코드 서식 기능을 추가합니다.",                                                                                                               "en": "Extends CKEditor 5 with social embeds, external link cards, HTML5 video uploads with autoplay, mute and loop controls, Markdown rendering, editor formatting, image paste, and code formatting."
+    },
+    "g7_version": ">=7.0.10",
+    "dependencies": {
+        "modules": {},
+        "plugins": {
+            "sirsoft-ckeditor5": ">=1.0.3"
+        }
+    },
+    "assets": {
+        "js": {
+            "entry": "resources/js/index.js",
+            "output": "dist/js/plugin.iife.js"
+        },
+        "css": {
+            "entry": "resources/css/plugin.css",
+            "output": "dist/css/plugin.css"
+        },
+        "handlers": true
+    },
+    "loading": {
+        "strategy": "global",
+        "priority": 111
+    }
+}
+

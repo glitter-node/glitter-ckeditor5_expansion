@@ -1,0 +1,212 @@
+  var VIDEO_META = '/api/plugins/' + IDENTIFIER + '/video/meta';
+
+  /** 편집기 컨테이너 하나에 업로드 바 + 미디어 라이브러리를 붙인다 (중복 방지). */
+  function attachUploaderTo(container) {
+    if (container.__gceVideo) return;
+    var cfg = readSettings();
+    if (!cfg.videoEnabled) return;
+    container.__gceVideo = true;
+
+    var exts = allowedVideoExts(cfg);
+    var MIME = { mp4: 'video/mp4', mov: 'video/quicktime', webm: 'video/webm' }; // 허용 확장자에 맞는 MIME 만
+    var accept = exts.map(function (x) { return '.' + x; }).concat(exts.map(function (x) { return MIME[x]; }).filter(Boolean)).join(',');
+
+    var bar = document.createElement('div');
+    bar.className = 'gce-vbar';
+    bar.innerHTML =
+      '<button type="button" class="gce-vbar__btn">' + esc(t('editor.video.button', '동영상 업로드')) + '</button>'
+      + '<span class="gce-vbar__hint">' + esc(t('editor.video.hint', '{exts} · 최대 {max}MB').replace('{exts}', exts.map(function (x) { return x.toUpperCase(); }).join('/')).replace('{max}', String(cfg.videoMaxMb))) + '</span>'
+      + '<progress class="gce-vbar__prog" max="100" value="0" hidden></progress>'
+      + '<span class="gce-vbar__msg"></span>'
+      + '<input type="file" accept="' + accept + '" hidden>';
+    try { container.parentNode.insertBefore(bar, container); } catch (e) { warnOnce('video upload bar', e); return; }
+
+    var btn = bar.querySelector('.gce-vbar__btn');
+    var input = bar.querySelector('input[type=file]');
+    var prog = bar.querySelector('.gce-vbar__prog');
+    var msg = bar.querySelector('.gce-vbar__msg');
+
+    // ---- 미디어 라이브러리 ----
+    var lib = document.createElement('div');
+    lib.className = 'gce-vlib';
+    lib.hidden = true;
+    lib.innerHTML = '<div class="gce-vlib__head">' + esc(t('editor.video.library', '동영상 라이브러리')) + '</div><div class="gce-vlib__list"></div>';
+    var libList = lib.querySelector('.gce-vlib__list');
+    try { container.parentNode.insertBefore(lib, container); } catch (e) { warnOnce('video upload bar', e); return; }
+
+    var libIndex = {}; // videoId -> card element
+
+    function currentEditor() { return editorInstanceNear(container); }
+
+    /** 라이브러리 카드 추가 (동영상 id 기준 중복 제거). */
+    function addLibCard(url, name, mime) {
+      var id = videoIdOf(url);
+      if (!id || libIndex[id]) return;
+      lib.hidden = false;
+
+      var card = document.createElement('div');
+      card.className = 'gce-vlib__card';
+      card.setAttribute('data-vid', id);
+      var baseUrl = videoUrlWithoutPlayback(videoUrlWithSize(url, 'md'));
+
+      var v = document.createElement('video');
+      v.controls = true; v.preload = 'metadata'; v.playsInline = true; v.src = baseUrl;
+      card.appendChild(v);
+
+      var nameEl = document.createElement('div');
+      nameEl.className = 'gce-vlib__name';
+      nameEl.textContent = name || id;
+      nameEl.title = name || id;
+      card.appendChild(nameEl);
+
+      var row = document.createElement('div');
+      row.className = 'gce-vlib__row';
+      var size = 'md';
+      var options = videoOptionsFromUrl(url);
+      ['sm', 'md', 'lg'].forEach(function (s) {
+        var b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'gce-vlib__sz' + (s === size ? ' is-on' : '');
+        b.textContent = t('editor.video.size_' + s, s === 'sm' ? '소' : (s === 'lg' ? '대' : '중'));
+        b.addEventListener('click', function (ev) {
+          ev.stopPropagation();
+          size = s;
+          row.querySelectorAll('.gce-vlib__sz').forEach(function (x) { x.classList.remove('is-on'); });
+          b.classList.add('is-on');
+        });
+        row.appendChild(b);
+      });
+      [
+        ['autoplay', 'editor.video.autoplay', '자동 재생'],
+        ['muted', 'editor.video.muted', '음소거'],
+        ['loop', 'editor.video.loop', '반복 재생']
+      ].forEach(function (item) {
+        var label = document.createElement('label');
+        label.className = 'gce-vlib__opt';
+        var input = document.createElement('input');
+        input.type = 'checkbox';
+        input.checked = !!options[item[0]];
+        input.setAttribute('data-option', item[0]);
+        var text = document.createElement('span');
+        text.textContent = t(item[1], item[2]);
+        label.appendChild(input);
+        label.appendChild(text);
+        input.addEventListener('change', function () {
+          options[item[0]] = input.checked;
+          if (item[0] === 'autoplay' && input.checked) {
+            options.muted = true;
+            var mutedInput = row.querySelector('input[data-option="muted"]');
+            if (mutedInput) mutedInput.checked = true;
+          }
+        });
+        row.appendChild(label);
+      });
+      var ins = document.createElement('button');
+      ins.type = 'button';
+      ins.className = 'gce-vlib__ins';
+      ins.textContent = t('editor.video.insert', '본문에 삽입');
+      var doInsert = function () {
+        var ed = currentEditor();
+        if (!ed) { msg.textContent = t('editor.video.err_editor', '에디터를 찾지 못했습니다. 잠시 후 다시 시도하세요.'); return; }
+        insertVideoLink(ed, baseUrl, name || id, size, options);
+      };
+      ins.addEventListener('click', function (ev) { ev.stopPropagation(); doInsert(); });
+      row.appendChild(ins);
+      card.appendChild(row);
+
+      libIndex[id] = card;
+      libList.appendChild(card);
+    }
+
+    /** 에디터 본문(getData)에 이미 들어 있는 동영상들을 라이브러리에 채운다 (수정 화면 대응). */
+    function hydrateFromEditor() {
+      var ed = currentEditor();
+      if (!ed) return;
+      var data = '';
+      try { data = ed.getData() || ''; } catch (e) { return; }
+      var ids = [], sourceUrls = {}, m, re = /\/api\/plugins\/glitter-ckeditor5_expansion\/video\/([a-f0-9]{32})\b/gi;
+      while ((m = re.exec(data)) !== null) {
+        var id = m[1].toLowerCase();
+        if (ids.indexOf(id) === -1 && !libIndex[id]) ids.push(id);
+      }
+      var holder = document.createElement('div');
+      holder.innerHTML = data;
+      holder.querySelectorAll('a[href]').forEach(function (anchor) {
+        var id = videoIdOf(anchor.getAttribute('href') || '');
+        if (id && !sourceUrls[id]) sourceUrls[id] = anchor.getAttribute('href');
+      });
+      if (!ids.length) return;
+      fetch(VIDEO_META, {
+        method: 'POST',
+        headers: Object.assign({ 'Content-Type': 'application/json', Accept: 'application/json' }, authHeaders()),
+        body: JSON.stringify({ ids: ids })
+      })
+        .then(function (r) { return r.ok ? r.json() : []; })
+        .then(function (list) {
+          (Array.isArray(list) ? list : []).forEach(function (it) {
+            if (it && it.url) {
+              var sourceUrl = sourceUrls[videoIdOf(it.url)] || it.url;
+              addLibCard(sourceUrl, it.name || '', it.mime || '');
+            }
+          });
+        })
+        .catch(function () {});
+    }
+    // 편집기 콘텐츠가 늦게 세팅될 수 있어 몇 차례 시도
+    [200, 800, 2000].forEach(function (ms) { window.setTimeout(hydrateFromEditor, ms); });
+
+    btn.addEventListener('click', function () { msg.textContent = ''; input.click(); });
+
+    input.addEventListener('change', function () {
+      var file = input.files && input.files[0];
+      input.value = '';
+      if (!file) return;
+      var c = readSettings();
+      var ext = (file.name.split('.').pop() || '').toLowerCase();
+      if (allowedVideoExts(c).indexOf(ext) === -1) { msg.textContent = t('editor.video.err_ext', 'MP4 파일만 업로드할 수 있습니다.'); return; }
+      if (file.size > c.videoMaxMb * 1024 * 1024) {
+        msg.textContent = t('editor.video.err_size', '파일이 너무 큽니다 (최대 {max}MB).').replace('{max}', String(c.videoMaxMb)).replace('{cur}', humanMb(file.size));
+        return;
+      }
+      var editor = currentEditor();
+      if (!editor) { msg.textContent = t('editor.video.err_editor', '에디터를 찾지 못했습니다. 잠시 후 다시 시도하세요.'); return; }
+
+      btn.disabled = true;
+      prog.hidden = false;
+      prog.value = 0;
+      var origLabel = btn.textContent;
+      btn.textContent = t('editor.video.uploading', '업로드 중…');
+
+      chunkedUpload(file, c, function (p) { prog.value = Math.round(p * 100); })
+        .then(function (r) {
+          var nm = r.name || file.name;
+          addLibCard(r.url, nm, r.mime || file.type || '');
+          insertVideoLink(editor, r.url, nm, 'md'); // 업로드 시 1회 자동 삽입 (기존 UX 유지)
+          msg.textContent = t('editor.video.done', '삽입되었습니다. 저장하면 게시글에서 재생됩니다.');
+          window.setTimeout(function () { if (msg && msg.textContent === t('editor.video.done', '삽입되었습니다. 저장하면 게시글에서 재생됩니다.')) msg.textContent = ''; }, 6000);
+        })
+        .catch(function (e) {
+          var errorMessage = e && e.message ? e.message : '';
+          msg.textContent = errorMessage === '인증이 필요합니다.'
+            ? t('editor.video.login_required', '로그인이 필요합니다.')
+            : (errorMessage || t('editor.video.err_generic', '업로드에 실패했습니다.'));
+        })
+        .then(function () {
+          btn.disabled = false;
+          btn.textContent = origLabel;
+          prog.hidden = true;
+        });
+    });
+  }
+
+  core.section({
+    name: 'video-upload',
+    scope: 'editor',
+    editorOrder: 10,
+    load: 'eager',
+    editor: attachUploaderTo
+  });
+
+
+
+

@@ -1,0 +1,21 @@
+{
+    "name": "plugins/glitter-ckeditor5_expansion",
+    "description": "CKEditor 5 expansion plugin for Gnuboard7 by Glitter.kr",
+    "type": "library",
+    "version": "0.1.7",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Glitter.kr"
+        }
+    ],
+    "require": {
+        "php": "^8.2"
+    },
+    "autoload": {
+        "psr-4": {
+            "Plugins\\Glitter\\Ckeditor5Expansion\\": ["src/", "./"]
+        }
+    }
+}
+

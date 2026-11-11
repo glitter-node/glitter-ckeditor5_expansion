@@ -1,0 +1,68 @@
+  /* ================================================================ *
+   *  공통 유틸
+   * ================================================================ */
+
+  var EMBED_WRAPPER_CLASS = 'ck5-media-embed';
+  // public_id 만 잡으면 되므로 상대/절대 URL 모두 매칭. 링크 텍스트는 상관 안 함.
+  var VIDEO_URL_RE = /\/api\/plugins\/glitter-ckeditor5_expansion\/video\/([a-f0-9]{32})\b/i;
+
+  var dynamicSheets = {};
+  function setDynamicRule(name, css) {
+    if (!('adoptedStyleSheets' in document) || typeof CSSStyleSheet === 'undefined') {
+      warnOnce('configurable styles require constructable stylesheets', new Error('Constructable stylesheets are unavailable'));
+      return;
+    }
+    var sheet = dynamicSheets[name];
+    if (!sheet) {
+      sheet = new CSSStyleSheet();
+      dynamicSheets[name] = sheet;
+      document.adoptedStyleSheets = document.adoptedStyleSheets.concat(sheet);
+    }
+    sheet.replaceSync(css);
+  }
+
+  function esc(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  function authToken() {
+    try {
+      if (window.G7Core && window.G7Core.apiClient && window.G7Core.apiClient.getToken) {
+        return window.G7Core.apiClient.getToken() || '';
+      }
+    } catch (e) {}
+    try { return localStorage.getItem('auth_token') || ''; } catch (e) { return ''; }
+  }
+
+  function isBareUrlLink(a) {
+    var href = a.getAttribute('href') || '';
+    if (!/^https?:\/\//i.test(href)) return false;
+    var text = (a.textContent || '').trim();
+    if (!/^https?:\/\//i.test(text)) return false;
+    var norm = function (u) { return u.replace(/\/+$/, '').toLowerCase(); };
+    return norm(text) === norm(href);
+  }
+
+  /** block(주로 <p>)의 유일한 의미 있는 자식이 맨URL 링크면 그 링크를 반환 */
+  function soleLinkOf(block) {
+    if ((block.textContent || '').trim() === '') return null;
+    var els = [];
+    for (var i = 0; i < block.children.length; i++) els.push(block.children[i]);
+    if (els.length !== 1) return null;
+    var only = els[0];
+    if (only.tagName !== 'A') return null;
+    if ((block.textContent || '').trim() !== (only.textContent || '').trim()) return null;
+    return isBareUrlLink(only) ? only : null;
+  }
+
+  var warnedTags = {}; // warnOnce 가 이미 알린 대상
+
+  /** 안전장치 공통: 예외로 건너뛴 대상(tag)을 console.warn 으로 한 번만 알린다(09a 방식, console.error 는 쓰지 않는다). */
+  function warnOnce(tag, reason) {
+    if (warnedTags[tag]) return;
+    warnedTags[tag] = true;
+    try { console.warn('[' + IDENTIFIER + '] ' + tag + ' skipped: ' + (reason && reason.message ? reason.message : reason)); } catch (e) {}
+  }
+
+
+
